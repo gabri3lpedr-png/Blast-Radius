@@ -45,6 +45,8 @@ from blast.mapdb import MapDB
 # Built at docker build time by blast/build_index.py (eval_sample.py builds it into .cache/).
 INDEX_DIR = Path(os.environ.get("INDEX_DIR", Path(__file__).resolve().parent.parent / "index"))
 FUNC_LEVEL = os.environ.get("FUNC_LEVEL", "1") != "0"
+# Rule s (setUpClass stopgap) on/off. SETUP_STOPGAP=1 on, 0 off.
+SETUP_STOPGAP = os.environ.get("SETUP_STOPGAP", "1") != "0"
 MAX_DEPTH = 3
 MAX_REF_FILES = 15  # a name used more widely than this -> FULL (cheaper than parsing it all)
 MAX_REF_LINES = 300
@@ -76,8 +78,10 @@ class Ctx:
         func_level: bool = FUNC_LEVEL,
         index_dir: Path = INDEX_DIR,
         fixture_index: TestIndex | None = None,
-        setup_stopgap: bool = True,
+        setup_stopgap: bool | None = None,
     ):
+        if setup_stopgap is None:
+            setup_stopgap = SETUP_STOPGAP
         self.src = src
         self.db = db
         self.func_level = func_level

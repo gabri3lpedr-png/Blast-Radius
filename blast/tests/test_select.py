@@ -470,6 +470,17 @@ class SetupStopgapTest(RulesTest):
         )
         self.assertEqual(got, {AGG, SCALAR}, trail)
 
+    def test_s_env_flag_off_disables_the_rule(self):
+        saved = sel.SETUP_STOPGAP
+        try:
+            sel.SETUP_STOPGAP = False
+            self.assertEqual(self.ctx().group_of_first, {})
+            got, trail = self.run_sel({"tests/fixtures/optimizer/tpc-h/tpc-h.sql": ("SELECT 1;\n", "SELECT 2;\n")})
+            self.assertEqual(got, {AGG, TPCH_OPT})
+            self.assertNotIn("s:", trail)
+        finally:
+            sel.SETUP_STOPGAP = saved
+
     def test_s_single_test_class_is_not_a_group(self):
         ctx = self.ctx()
         self.assertEqual(set(ctx.group_of_first), {AGG, SIMPLIFY, MA})

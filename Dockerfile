@@ -20,4 +20,6 @@ RUN python /app/blast/build_index.py /opt/sqlglot /app/index \
     && chmod -R a+rX /app
 # Rule families forced back to FULL (blast/safe.py): comma list of A-E, empty = all rules on.
 ENV SAFE_GROUPS=""
+# Rule s, setUpClass stopgap (blast/select.py): 1 on, 0 off. Map v3 credits class setup itself.
+ENV SETUP_STOPGAP="1"
 CMD ["python", "/app/selector.py"]

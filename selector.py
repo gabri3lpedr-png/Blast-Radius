@@ -55,7 +55,8 @@ def main() -> None:
         if ctx is None:
             db = mapdb.load(number_by_id)
             log(f"map {db.name}: {'EMPTY' if db.empty else 'loaded'}, {len(db.unmapped)} unmapped, "
-                f"FUNC_LEVEL={int(sel.FUNC_LEVEL)}, SAFE_GROUPS={safe.describe()}")
+                f"FUNC_LEVEL={int(sel.FUNC_LEVEL)}, SETUP_STOPGAP={int(sel.SETUP_STOPGAP)}, "
+                f"SAFE_GROUPS={safe.describe()}")
             ctx = sel.Ctx(SRC, db, tests)
         return ctx
     all_tests = sorted(ms)
