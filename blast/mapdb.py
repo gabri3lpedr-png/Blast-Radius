@@ -66,6 +66,11 @@ class MapDB:
         class bodies) has import_lines but no per-test "lines"; it is mapped all the same."""
         return path in self._lines_raw or path in self._import_raw
 
+    def line_set_ids(self, path: str, lines) -> set[int]:
+        """The map set indexes of the tests that ran any of `lines` (one per distinct line set)."""
+        d = self._file_lines(path)
+        return {d[n] for n in lines if n in d}
+
     def line_tests(self, path: str, lines) -> frozenset[int] | None:
         """Union of the tests that ran any of `lines` during a test; None if none ran any."""
         d = self._file_lines(path)
@@ -83,6 +88,9 @@ class MapDB:
             s = frozenset(self._import_raw.get(path) or [])
             self._import[path] = s
         return s
+
+    def file_read_set_id(self, path: str) -> int | None:
+        return self.files_read.get(path)
 
     def file_read_tests(self, path: str) -> frozenset[int] | None:
         idx = self.files_read.get(path)

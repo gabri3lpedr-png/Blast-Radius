@@ -58,6 +58,15 @@ def case_binary_fixture(r):
     p.write_bytes(p.read_bytes() + b"\x00\xff")
 
 
+def case_fixture_tpch(r):
+    # read in TestExecutor.setUpClass: the map credits test_agg_order only (rule s)
+    p = r / "tests/fixtures/optimizer/tpc-h/tpc-h.sql"
+    text = p.read_text("utf-8")
+    old = "        l_returnflag,\n"
+    assert old in text
+    p.write_text(text.replace(old, "        l_returnflag + 1,\n", 1), "utf-8")
+
+
 def case_test_function(r):
     edit(r, "tests/test_transpile.py", '        self.assertEqual(transpile("0Êß")[0], "0 AS Êß")\n',
          '        self.assertEqual(transpile("0Êß")[0], "0 AS Êßx")\n')

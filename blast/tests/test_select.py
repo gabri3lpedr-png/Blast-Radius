@@ -165,7 +165,9 @@ class RulesTest(unittest.TestCase):
         cls._tmp.cleanup()
 
     def ctx(self, func_level=True, raw=FAKE_MAP) -> sel.Ctx:
-        return sel.Ctx(self.src, MapDB(raw, self.number_by_id), self.tests, func_level, self.index)
+        # rule s (setUpClass stopgap) has its own tests below (SetupStopgapTest)
+        return sel.Ctx(self.src, MapDB(raw, self.number_by_id), self.tests, func_level, self.index,
+                       setup_stopgap=False)
 
     def run_sel(self, edits: dict[str, tuple[str, str]], func_level=True, raw=FAKE_MAP):
         """edits: path -> (old line, new line) replaced once, or a full new text for data files."""
@@ -391,3 +393,89 @@ class RulesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# -- rule s: setUpClass stopgap ----------------------------------------------------------------
+EX = "tests/test_executor.py::TestExecutor::"
+OPT = "tests/test_optimizer.py::TestOptimizer::"
+S_IDS = [  # tests.json order = collection order
+    EX + "test_agg_order",      # 0  first of TestExecutor: setUpClass runs inside it
+    EX + "test_execute_tpcds",  # 1
+    EX + "test_execute_tpch",   # 2
+    EX + "test_scalar",         # 3
+    OPT + "test_simplify",      # 4  first of TestOptimizer
+    OPT + "test_tpch",          # 5
+    "tests/test_mod.py::TestMod::test_a",  # 6 first of TestMod
+    "tests/test_mod.py::TestMod::test_b",  # 7
+]
+AGG, TPCDS, TPCH_EX, SCALAR, SIMPLIFY, TPCH_OPT, MA, MB = range(8)
+S_MAP = {
+    "version": 1, "tests": S_IDS,
+    "sets": [[AGG, TPCH_OPT], [AGG], [AGG, SCALAR], [MA], [SIMPLIFY, TPCH_OPT], [TPCH_OPT]],
+    "lines": {"sqlglot/mod.py": {"5": 1, "6": 2, "17": 3}, "sqlglot/user.py": {"5": 4}},
+    "import_lines": {"sqlglot/mod.py": [1, 4, 9, 13, 14, 16], "sqlglot/user.py": [1, 4]},
+    "files_read": {"tests/fixtures/optimizer/tpc-h/tpc-h.sql": 0,
+                   "tests/fixtures/optimizer/simplify.sql": 4,
+                   "tests/fixtures/optimizer/tpc-h/other.sql": 5},
+    "class_users": {}, "failed_at_baseline": [], "meta": {},
+}
+EXECUTOR = {AGG, TPCDS, TPCH_EX, SCALAR}
+
+
+class SetupStopgapTest(RulesTest):
+    """Rule s against an executor-shaped fake map (same source tree as RulesTest)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.tests = [{"number": i, "id": tid, "file": tid.split("::")[0], "seconds": 1.0}
+                     for i, tid in enumerate(S_IDS)]
+        cls.number_by_id = {t["id"]: t["number"] for t in cls.tests}
+
+    def ctx(self, func_level=True, raw=S_MAP) -> sel.Ctx:
+        return sel.Ctx(self.src, MapDB(raw, self.number_by_id), self.tests, func_level, self.index)
+
+    def assertSelects(self, edits, expected, func_level=True, raw=S_MAP):
+        return super().assertSelects(edits, expected, func_level, raw)
+
+    def run_sel(self, edits, func_level=True, raw=S_MAP):
+        return super().run_sel(edits, func_level, raw)
+
+    def test_s_tpch_fixture_reaches_test_execute_tpch(self):
+        # tpc-h.sql is read in TestExecutor.setUpClass: the map credits test_agg_order only
+        got, trail = self.run_sel({"tests/fixtures/optimizer/tpc-h/tpc-h.sql": ("SELECT 1;\n", "SELECT 2;\n")})
+        self.assertIn(TPCH_EX, got)
+        self.assertEqual(got, EXECUTOR | {TPCH_OPT}, trail)
+        self.assertIn("s:+3", trail)
+
+    def test_s_files_read_expands_even_when_class_mates_also_read(self):
+        # simplify.sql: first of TestOptimizer + test_tpch -> still the whole class (files: always)
+        got, _ = self.run_sel({"tests/fixtures/optimizer/simplify.sql": ("a\n", "b\n")})
+        self.assertEqual(got, {SIMPLIFY, TPCH_OPT})
+
+    def test_s_files_read_without_a_first_test_is_unchanged(self):
+        got, trail = self.run_sel({"tests/fixtures/optimizer/tpc-h/other.sql": ("a\n", "b\n")})
+        self.assertEqual(got, {TPCH_OPT})
+        self.assertNotIn("s:", trail)
+
+    def test_s_line_credited_to_first_test_alone_expands(self):
+        got, trail = self.run_sel({"sqlglot/mod.py": ("    y = x + 1\n", "    y = x + 2\n")}, func_level=False)
+        self.assertEqual(got, EXECUTOR, trail)
+        self.assertIn("s:a:L5", trail)
+
+    def test_s_line_shared_with_a_class_mate_does_not_expand(self):
+        # line 6 ran in test_agg_order AND test_scalar: not setUpClass-only evidence
+        got, trail = self.run_sel(
+            {"sqlglot/mod.py": ("    return y * LIMIT\n", "    return y * LIMIT * 2\n")}, func_level=False
+        )
+        self.assertEqual(got, {AGG, SCALAR}, trail)
+
+    def test_s_single_test_class_is_not_a_group(self):
+        ctx = self.ctx()
+        self.assertEqual(set(ctx.group_of_first), {AGG, SIMPLIFY, MA})
+        self.assertEqual(ctx.group_of_first[AGG], frozenset(EXECUTOR))
+
+    # RulesTest's own cases assume the stopgap off; do not rerun them here
+    for _name in [n for n in dir(RulesTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name

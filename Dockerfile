@@ -19,5 +19,5 @@ RUN python /app/blast/build_index.py /opt/sqlglot /app/index \
     && rm -rf /app/blast/tests \
     && chmod -R a+rX /app
 # Rule families forced back to FULL (blast/safe.py): comma list of A-E, empty = all rules on.
-ENV SAFE_GROUPS="B,D"
+ENV SAFE_GROUPS=""
 CMD ["python", "/app/selector.py"]

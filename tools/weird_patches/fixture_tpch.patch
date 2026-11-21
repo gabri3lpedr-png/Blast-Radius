@@ -1,0 +1,13 @@
+diff --git a/tests/fixtures/optimizer/tpc-h/tpc-h.sql b/tests/fixtures/optimizer/tpc-h/tpc-h.sql
+index c4e442b..71341de 100644
+--- a/tests/fixtures/optimizer/tpc-h/tpc-h.sql
++++ b/tests/fixtures/optimizer/tpc-h/tpc-h.sql
+@@ -2,7 +2,7 @@
+ -- TPC-H 1
+ --------------------------------------
+ select
+-        l_returnflag,
++        l_returnflag + 1,
+         l_linestatus,
+         sum(l_quantity) as sum_qty,
+         sum(l_extendedprice) as sum_base_price,

@@ -13,6 +13,10 @@ Rules (docs/GUIDE_B_Selector.md, Stage B3):
     all tests in the file + tests covering the helper.
  e) DATA files: files_read; nothing -> fixture name fallback (blast/fixtures.py); else FULL.
  f) Always add failed_at_baseline, and UNMAPPED tests living in a file we selected from.
+ s) setUpClass stopgap: class-level setup runs inside the FIRST test of its class (tests.json
+    order = collection order) and the map credits it to that test alone. So when a files_read
+    set contains the first test of a class, every test of that class is added; for map lines,
+    only when the line's test set holds that first test and no other test of the class.
  g) Tests that run `import sqlglot` in a SUBPROCESS (the map cannot see them, e.g. test_lazy_load):
     added when a commit changes import-time code (module level, class body, def header) of a
     module that `import sqlglot` loads: IMPORT_SQLGLOT (hand list) union index/import_sqlglot.json
@@ -72,6 +76,7 @@ class Ctx:
         func_level: bool = FUNC_LEVEL,
         index_dir: Path = INDEX_DIR,
         fixture_index: TestIndex | None = None,
+        setup_stopgap: bool = True,
     ):
         self.src = src
         self.db = db
@@ -85,11 +90,53 @@ class Ctx:
         for t in tests:
             self.tests_by_file.setdefault(t["file"], set()).add(t["number"])
         self.tests_by_file = {k: frozenset(v) for k, v in self.tests_by_file.items()}
+        # rule s: test groups (file::Class, or the file for module-level tests), in tests.json order
+        groups: dict[str, list[int]] = {}
+        for t in tests:
+            head, _, _name = t["id"].rpartition("::")
+            groups.setdefault(head if "::" in head else t["file"], []).append(t["number"])
+        self.group_of_first: dict[int, frozenset[int]] = {
+            members[0]: frozenset(members) for members in groups.values() if len(members) > 1
+        } if setup_stopgap else {}
+        self._setup_extra: dict[tuple[str, int], frozenset[int]] = {}
         self._loc: dict[str, Locator] = {}
         self.import_sqlglot = _import_sqlglot(index_dir / "import_sqlglot.json")
         self.subprocess_import_tests = frozenset(
             self.number_by_id[i] for i in SUBPROCESS_IMPORT_TESTS if i in self.number_by_id
         )
+
+    # -- rule s ------------------------------------------------------------------------------
+    def _extra_for_set(self, kind: str, idx: int) -> frozenset[int]:
+        """Tests of classes whose first test is in set `idx` and, for "lines", alone in it."""
+        key = (kind, idx)
+        extra = self._setup_extra.get(key)
+        if extra is None:
+            s = self.db.tests_of_set(idx)
+            out: set[int] = set()
+            for n in s:
+                group = self.group_of_first.get(n)
+                if group is not None and (kind == "files" or len(s & group) == 1):
+                    out |= group
+            extra = self._setup_extra[key] = frozenset(out - s)
+        return extra
+
+    def line_tests(self, path: str, lines) -> tuple[frozenset[int] | None, frozenset[int]]:
+        """(tests the map credits with any of `lines` or None, rule-s extra tests)."""
+        ids = self.db.line_set_ids(path, lines)
+        if not ids:
+            return None, frozenset()
+        base: set[int] = set()
+        extra: set[int] = set()
+        for i in ids:
+            base |= self.db.tests_of_set(i)
+            extra |= self._extra_for_set("lines", i)
+        return frozenset(base), frozenset(extra - base)
+
+    def file_read_tests(self, path: str) -> tuple[frozenset[int] | None, frozenset[int]]:
+        idx = self.db.file_read_set_id(path)
+        if idx is None:
+            return None, frozenset()
+        return self.db.tests_of_set(idx), self._extra_for_set("files", idx)
 
     def loaded_by_import_sqlglot(self, path: str) -> bool:
         return path in self.import_sqlglot or any(
@@ -165,6 +212,18 @@ class _File:
             return True
         return False
 
+    def map_lines(self, path: str, lines, tag: str | None) -> bool:
+        """Rule a/c lookup (+ rule s extra); True when the map credits any test with `lines`."""
+        base, extra = self.ctx.line_tests(path, lines)
+        if base is None:
+            return False
+        if tag is None:
+            self.out |= base | extra
+        else:
+            self.add(base, tag)
+            self.add(extra, f"s:{tag}")
+        return bool(base)
+
     # -- rule b: import-time effect of a location ----------------------------------------
     def import_effect(self, path: str, loc: Loc, depth: int) -> None:
         ctx = self.ctx
@@ -209,9 +268,7 @@ class _File:
             imp = ctx.db.import_lines(p)
             for line in lines:
                 loc = lp.locate(line)
-                ran = ctx.db.line_tests(p, loc.stmt_lines)
-                if ran:
-                    self.out |= ran
+                self.map_lines(p, loc.stmt_lines, None)
                 if loc.kind == "def_body":
                     if any(n in imp for n in loc.stmt_lines):
                         raise Full(f"{p}:{line} uses {name} in a def run at import")
@@ -227,12 +284,12 @@ class _File:
         imp = ctx.db.import_lines(path)
         if loc.kind == "def_body" and safe.on("C"):
             raise Full(f"SAFE C: {path}:{loc.line} runtime line")
-        hit = self.add(ctx.db.line_tests(path, loc.stmt_lines), f"a:L{loc.line}")
+        hit = self.map_lines(path, loc.stmt_lines, f"a:L{loc.line}")
         if loc.kind == "def_body":
             if any(n in imp for n in loc.stmt_lines):
                 raise Full(f"{path}:{loc.line} def body runs at import")
             if ctx.func_level:
-                hit |= self.add(ctx.db.line_tests(path, _def_lines(loc.func)), f"c:def {loc.func.name}")
+                hit |= self.map_lines(path, _def_lines(loc.func), f"c:def {loc.func.name}")
             if not hit:
                 if safe.on("E"):
                     raise Full(f"SAFE E: {path}:{loc.line} dead line")
@@ -240,14 +297,14 @@ class _File:
             return
         self.import_time = True  # module level, class body or def header
         if loc.kind == "def_header":
-            self.add(ctx.db.line_tests(path, _def_lines(loc.func)), f"b:def {loc.func.name}")
+            self.map_lines(path, _def_lines(loc.func), f"b:def {loc.func.name}")
         self.import_effect(path, loc, 0)
 
     # -- rule d: a tests/*.py line -------------------------------------------------------
     def test_line(self, loc: Loc) -> None:
         ctx, path = self.ctx, self.path
         if loc.kind != "def_body":
-            self.add(ctx.db.line_tests(path, loc.stmt_lines), f"a:L{loc.line}")
+            self.map_lines(path, loc.stmt_lines, f"a:L{loc.line}")
             self.import_effect(path, loc, 0)
             return
         top = loc.top
@@ -260,11 +317,11 @@ class _File:
                 test_id = f"{path}::{top.name}::{unit.name}"
         if test_id is not None and test_id in ctx.number_by_id:
             self.add(frozenset([ctx.number_by_id[test_id]]), f"d:{unit.name}")
-            self.add(ctx.db.line_tests(path, loc.stmt_lines), f"a:L{loc.line}")
+            self.map_lines(path, loc.stmt_lines, f"a:L{loc.line}")
             return
         # helper (setUp, a helper method or function): every test of the file + its users
         self.add(ctx.tests_by_file.get(path), "d:file")
-        self.add(ctx.db.line_tests(path, _def_lines(unit)), f"d:helper {getattr(unit, 'name', '?')}")
+        self.map_lines(path, _def_lines(unit), f"d:helper {getattr(unit, 'name', '?')}")
         if not ctx.tests_by_file.get(path) and not self.out:
             raise Full(f"helper {path}:{loc.line} has no known users")
 
@@ -323,7 +380,11 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
         elif v.kind == prover.DATA:
             if safe.on("D"):
                 raise Full(f"SAFE D: {v.path}")
-            t, rule = ctx.db.file_read_tests(v.path), "e:files_read"
+            t, extra = ctx.file_read_tests(v.path)
+            rule = "e:files_read"
+            if t and extra:
+                t = t | extra
+                rule += f" s:+{len(extra)}"
             if not t and v.path.startswith("tests/fixtures/"):
                 t = frozenset(
                     ctx.number_by_id[i] for i in ctx.fixtures.tests_mentioning(v.path) if i in ctx.number_by_id

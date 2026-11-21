@@ -151,6 +151,13 @@ class WeirdPatchesEndToEnd(unittest.TestCase):
         self.assertEqual(got, expected)
         self.assertEqual(selected["test_function"], selected["test_function"] & selected["five_files"])
         self.assertEqual(selected["docstring_only"], set())
+        # rule s: tpc-h.sql is read in TestExecutor.setUpClass (credited to test_agg_order only)
+        tests = json.loads((ROOT / "sample" / "tests.json").read_text("utf-8"))["tests"]
+        num = {t["id"]: t["number"] for t in tests}
+        executor = {n for i, n in num.items() if i.startswith("tests/test_executor.py::TestExecutor::")}
+        self.assertIn(num["tests/test_executor.py::TestExecutor::test_execute_tpch"], selected["fixture_tpch"])
+        self.assertIn(num["tests/test_optimizer.py::TestOptimizer::test_tpch"], selected["fixture_tpch"])
+        self.assertLessEqual(executor, selected["fixture_tpch"])
 
 
 if __name__ == "__main__":
