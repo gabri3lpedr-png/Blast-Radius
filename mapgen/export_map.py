@@ -100,6 +100,11 @@ def main(raw, out_path):
 
     files_read = {p: set_of(ns) for p, ns in extra["files_read"].items()}
     class_users = {k: set_of(ns) for k, ns in extra["class_users"].items()}
+    # map v4 (docs/GUIDE_B_Selector.md "v4 contract"); absent in older raw output
+    attr_users = {k: set_of(ns) for k, ns in extra.get("attr_users", {}).items()}
+    key_users = {k: set_of(ns) for k, ns in extra.get("key_users", {}).items()}
+    attr_import = sorted(extra.get("attr_import", []))
+    key_import = sorted(extra.get("key_import", []))
 
     meta = dict(extra["meta"])
     meta.update({
@@ -110,6 +115,10 @@ def main(raw, out_path):
         "import_lines": sum(len(v) for v in import_lines.values()),
         "files_read": len(files_read),
         "class_users": len(class_users),
+        "attr_users": len(attr_users),
+        "key_users": len(key_users),
+        "attr_import": len(attr_import),
+        "key_import": len(key_import),
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     })
     doc = {
@@ -121,6 +130,10 @@ def main(raw, out_path):
         "import_lines": import_lines,
         "files_read": files_read,
         "class_users": class_users,
+        "attr_users": attr_users,
+        "key_users": key_users,
+        "attr_import": attr_import,
+        "key_import": key_import,
         "failed_at_baseline": sorted(extra["failed"]),
         "meta": meta,
     }
@@ -131,7 +144,8 @@ def main(raw, out_path):
     os.chmod(out_path, 0o644)
     print(f"wrote {out_path}: {len(blob) / 1e6:.2f} MB gzipped, {len(tests)} tests, "
           f"{len(sets)} sets, {meta['lines']} lines, {meta['import_lines']} import lines, "
-          f"{len(files_read)} files_read, {len(class_users)} class_users "
+          f"{len(files_read)} files_read, {len(class_users)} class_users, "
+          f"{len(attr_users)} attr_users, {len(key_users)} key_users "
           f"({time.time() - t0:.1f} s)")
     if extra["failed"]:
         print(f"WARNING failed at baseline: {sorted(extra['failed'])}")

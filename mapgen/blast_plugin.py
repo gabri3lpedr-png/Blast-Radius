@@ -28,6 +28,11 @@ _cov = coverage.Coverage(
     branch=False,
 )
 _cov.start()
+
+# Map v4: class attribute / dict key tracking, installed BEFORE sqlglot is imported.
+import attr_tracker  # noqa: E402
+
+attr_tracker.install()
 _t0 = time.time()
 
 # ---------------------------------------------------------------- state
@@ -121,6 +126,10 @@ for _m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
         __import__(_m.name)
     except Exception as e:  # optional deps etc.
         _import_errors.append(f"{_m.name}: {type(e).__name__}: {e}")
+
+
+attr_tracker.track_dispatch()
+attr_tracker.sweep()
 
 
 def _base_classes():
@@ -248,11 +257,13 @@ def pytest_runtest_protocol(item, nextitem):
     _files.setdefault(nid, set())
     _types.setdefault(nid, set())
     _patch_new_classes()
+    attr_tracker.sweep()
     _phase(nid)
     try:
         yield
     finally:
         _cov.switch_context("")
+        attr_tracker.set_context("")
         _current = None
 
 
@@ -264,6 +275,7 @@ def pytest_runtest_protocol(item, nextitem):
 def _phase(key):
     global _current
     _current = key
+    attr_tracker.set_context(key)
     _files.setdefault(key, set())
     _types.setdefault(key, set())
     _cov.switch_context(key)
@@ -327,5 +339,8 @@ def pytest_unconfigure(config):
             "import_errors": _import_errors,
         },
     }
+    v4 = attr_tracker.export(_scope_tests)
+    extra["meta"].update(v4.pop("meta"))
+    extra.update(v4)
     with _real_open(os.path.join(OUT, "blast_extra.json"), "w") as f:
         json.dump(extra, f)

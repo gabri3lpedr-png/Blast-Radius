@@ -22,9 +22,11 @@ import re
 import sys
 from functools import lru_cache
 
-MAP = sys.argv[1] if len(sys.argv) > 1 else "maps/coverage_map.json.gz"
-SAMPLE = sys.argv[2] if len(sys.argv) > 2 else "sample"
-SRC = sys.argv[3] if len(sys.argv) > 3 else ".cache/sqlglot"
+V4 = "--v4" in sys.argv     # also grade map v4 keys (needs sqlglot importable: run in the image)
+ARGS = [a for a in sys.argv[1:] if a != "--v4"]
+MAP = ARGS[0] if len(ARGS) > 0 else "maps/coverage_map.json.gz"
+SAMPLE = ARGS[1] if len(ARGS) > 1 else "sample"
+SRC = ARGS[2] if len(ARGS) > 2 else ".cache/sqlglot"
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
@@ -127,6 +129,156 @@ def enclosing(path, line):
     return (inner[1], inner[2]) if inner else None, cls[1] if cls else None
 
 
+# ---------------------------------------------------------------- map v4
+def _class_stmt(tree, qual, line):
+    """The statement directly in class `qual`'s body that contains `line`."""
+    node = tree
+    for part in qual.split("."):
+        node = next((c for c in getattr(node, "body", []) if isinstance(c, ast.ClassDef)
+                     and c.name == part), None)
+        if node is None:
+            return None
+    for st in node.body:
+        start = min([st.lineno] + [d.lineno for d in getattr(st, "decorator_list", [])])
+        if start <= line <= st.end_lineno:
+            return st
+    return None
+
+
+def _assigned_name(st):
+    if isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+        return st.targets[0].id, st.value
+    if isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+        return st.target.id, st.value
+    return None, None
+
+
+def _spell(node):
+    """Contract spelling of a dict-literal key, from source (None = can't)."""
+    if isinstance(node, ast.Constant):
+        return repr(node.value)
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+    else:
+        return None
+    parts.reverse()
+    while len(parts) > 1 and parts[0][:1].islower():   # module alias: exp., parser.
+        parts.pop(0)
+    return ".".join(parts)
+
+
+def _dict_entries(value):
+    if not isinstance(value, ast.Dict):
+        return None
+    out = {}
+    for k, v in zip(value.keys, value.values):
+        if k is None:                      # **spread: not an entry of its own
+            continue
+        sk = _spell(k)
+        if sk is None:
+            return None
+        out[sk] = ast.dump(v)
+    return out
+
+
+@lru_cache(maxsize=None)
+def _subclass_keys(module, qual):
+    import importlib
+    import pkgutil
+    if not _subclass_keys.loaded:   # __subclasses__ only lists LOADED subclasses
+        import sqlglot
+        for mi in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+            try:
+                importlib.import_module(mi.name)
+            except Exception:
+                pass
+        _subclass_keys.loaded = True
+    try:
+        obj = importlib.import_module(module)
+        for part in qual.split("."):
+            obj = getattr(obj, part)
+    except Exception:
+        return None
+    seen, stack = set(), [obj]
+    while stack:
+        c = stack.pop()
+        if c in seen:
+            continue
+        seen.add(c)
+        stack.extend(type.__subclasses__(c))
+    return sorted({f"{c.__module__}:{c.__qualname__}" for c in seen
+                   if c.__module__.startswith("sqlglot")})
+
+
+_subclass_keys.loaded = False
+
+
+def attr_level(m, path, module, qual, line, new_src, nums):
+    """Tests for a class-body edit via attr_users/key_users, or None -> fall back
+    to class_users. For dicts, an import-time read of the attribute alone does
+    not force a fallback: only K[*] or K[changed key] in key_import does (the
+    metaclass reads every generator's TRANSFORMS at import just to pop the
+    JSONPath keys)."""
+    try:
+        old_tree = ast.parse(open(os.path.join(SRC, path)).read())
+        new_tree = ast.parse(new_src) if new_src is not None else None
+    except (OSError, SyntaxError):
+        return None
+    st = _class_stmt(old_tree, qual, line)
+    name, value = _assigned_name(st) if st is not None else (None, None)
+    if name is None:
+        return None
+    owners = _subclass_keys(module, qual)
+    if not owners:
+        return None
+    ks = [f"{o}.{name}" for o in owners]
+    au, ku = m.get("attr_users", {}), m.get("key_users", {})
+    ai, ki = set(m.get("attr_import", [])), set(m.get("key_import", []))
+    if not any(k in au for k in ks) and not any(k + "[*]" in ku or k + "[*]" in ki for k in ks) \
+            and not any(k in ai for k in ks):
+        return None                        # no key at all: never "nobody uses it"
+    old_e = _dict_entries(value)
+    new_e = None
+    if new_tree is not None:
+        nst = None
+        # find the same attribute in the patched class
+        node = new_tree
+        for part in qual.split("."):
+            node = next((c for c in getattr(node, "body", []) if isinstance(c, ast.ClassDef)
+                         and c.name == part), None)
+            if node is None:
+                break
+        if node is not None:
+            for st2 in node.body:
+                if _assigned_name(st2)[0] == name:
+                    nst = st2
+        if nst is not None:
+            new_e = _dict_entries(_assigned_name(nst)[1])
+    if old_e is not None and new_e is not None:
+        changed = {k for k in old_e.keys() | new_e.keys() if old_e.get(k) != new_e.get(k)}
+        if not changed:                     # e.g. only a comment or a ** spread moved
+            changed = {"*"}
+        if any(f"{k}[*]" in ki or any(f"{k}[{c}]" in ki for c in changed) for k in ks):
+            return None
+        out = set()
+        for k in ks:
+            for c in changed | {"*"}:
+                if f"{k}[{c}]" in ku:
+                    out |= nums(ku[f"{k}[{c}]"])
+        return out
+    if any(k in ai for k in ks):
+        return None
+    out = set()
+    for k in ks:
+        if k in au:
+            out |= nums(au[k])
+    return out
+
+
 def main():
     m = json.load(gzip.open(MAP))
     tj = json.load(open(os.path.join(SAMPLE, "tests.json")))
@@ -152,6 +304,7 @@ def main():
                 compile(src, path, "exec")
             except SyntaxError:
                 why_fb.append(f"syntax error {path}")
+        new_srcs = patched_sources(patch)
         for path, lines in parse_patch(patch).items():
             if path.startswith("NEW:"):
                 why_fb.append(f"new file {path[4:]}")
@@ -170,6 +323,11 @@ def main():
                     selected |= nums(file_lines[str(ln)])
                     continue
                 scope, cls = enclosing(path, ln)
+                if V4 and cls is not None and (scope is None or scope[0] == "class"):
+                    got = attr_level(m, path, module, cls, ln, new_srcs.get(path), nums)
+                    if got is not None:
+                        selected |= got
+                        continue
                 if cls is not None and (scope is None or scope[0] == "class" or ln in imp):
                     key = f"{module}:{cls}"
                     if key in m["class_users"]:
