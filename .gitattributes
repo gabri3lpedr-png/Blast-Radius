@@ -1,0 +1,2 @@
+# Exact bytes: some cases test CRLF and missing trailing newlines.
+tools/weird_patches/*.patch -text
