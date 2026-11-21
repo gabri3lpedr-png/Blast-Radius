@@ -41,5 +41,5 @@ commits: 30   commits with a MISS: 0   fallbacks (run all): 4   total selected s
 
 ## mutants_out/ (labelled mutants, dev-only, not in git)
 ```
-commits: 189   commits with a MISS: 0   fallbacks (run all): 50   total selected seconds: 6718.8
+commits: 313   commits with a MISS: 0   fallbacks (run all): 84   total selected seconds: 11086.6
 ```
