@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from blast import diff, mapdb, prover  # noqa: E402
+from blast import diff, mapdb, prover, safe  # noqa: E402
 from blast import select as sel  # noqa: E402
 from blast.log import log  # noqa: E402
 from blast.pack import duration_ms, pack  # noqa: E402
@@ -55,7 +55,7 @@ def main() -> None:
         if ctx is None:
             db = mapdb.load(number_by_id)
             log(f"map {db.name}: {'EMPTY' if db.empty else 'loaded'}, {len(db.unmapped)} unmapped, "
-                f"FUNC_LEVEL={int(sel.FUNC_LEVEL)}")
+                f"FUNC_LEVEL={int(sel.FUNC_LEVEL)}, SAFE_GROUPS={safe.describe()}")
             ctx = sel.Ctx(SRC, db, tests)
         return ctx
     all_tests = sorted(ms)

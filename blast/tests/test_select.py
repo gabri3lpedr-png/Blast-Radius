@@ -12,7 +12,9 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from blast import build_index, diff, prover
+from contextlib import contextmanager
+
+from blast import build_index, diff, prover, safe
 from blast import select as sel
 from blast.fixtures import TestIndex
 from blast.mapdb import MapDB
@@ -285,6 +287,69 @@ class RulesTest(unittest.TestCase):
                                {A, C, FLAKY})  # runtime-only changes do not need it
         finally:
             rec.write_text(saved, "utf-8")
+
+    # -- SAFE_GROUPS -------------------------------------------------------------------------
+    @contextmanager
+    def safe_groups(self, value: str):
+        saved = safe.GROUPS
+        safe.GROUPS = safe.parse(value)
+        try:
+            yield
+        finally:
+            safe.GROUPS = saved
+
+    def assertFullOnlyWith(self, group: str, edits, others: str = "ABCDE"):
+        """FULL with `group` listed; unchanged with every other group listed."""
+        base, _ = self.run_sel(edits)
+        with self.safe_groups(",".join(g for g in others if g != group)):
+            self.assertEqual(self.run_sel(edits)[0], base)
+        with self.safe_groups(group.lower() + " , "):
+            with self.assertRaises(sel.Full) as cm:
+                self.run_sel(edits)
+        self.assertIn(f"SAFE {group}", str(cm.exception))
+
+    def test_safe_parse(self):
+        self.assertEqual(safe.parse(" b, d ,,"), {"B", "D"})
+        self.assertEqual(safe.parse(""), frozenset())
+        self.assertEqual(safe.parse(None), frozenset())
+
+    def test_safe_b_class_users(self):
+        self.assertFullOnlyWith("B", {"sqlglot/mod.py": ('    KIND = "a"\n', '    KIND = "b"\n')})
+
+    def test_safe_b_name_chain(self):
+        self.assertFullOnlyWith("B", {"sqlglot/mod.py": ("LIMIT = 10\n", "LIMIT = 11\n")})
+
+    def test_safe_c_runtime_line(self):
+        self.assertFullOnlyWith("C", {"sqlglot/mod.py": ("    y = x + 1\n", "    y = x + 2\n")})
+
+    def test_safe_d_fixture(self):
+        self.assertFullOnlyWith("D", {"tests/fixtures/optimizer/bar.sql": ("SELECT 1;\n", "SELECT 2;\n")})
+
+    def test_safe_e_dead_line(self):
+        # a live line (helper) and a dead one (unused) in one file: DEAD contributes nothing.
+        # C would also turn this FULL (runtime lines), so the others are checked without C.
+        orig = (self.src / "sqlglot/mod.py").read_text("utf-8")
+        new = orig.replace("    y = x + 1\n", "    y = x + 2\n").replace("    return 0\n", "    return 1\n")
+        text = patch_for("sqlglot/mod.py", orig, new)
+
+        def run():
+            return sel.select(self.ctx(), [prover.classify(fp, self.src) for fp in diff.parse(text)])
+
+        base, trail = run()
+        self.assertIn("DEAD L10", trail)
+        with self.safe_groups("A,B,D"):
+            self.assertEqual(run()[0], base)
+        with self.safe_groups("E"):
+            with self.assertRaises(sel.Full) as cm:
+                run()
+        self.assertIn("SAFE E", str(cm.exception))
+
+    def test_safe_test_function_edit_is_never_widened(self):
+        edits = {"tests/test_mod.py": ("        self.assertTrue(True)\n\n    def test_c",
+                                       "        self.assertTrue(False)\n\n    def test_c")}
+        base, _ = self.run_sel(edits)
+        with self.safe_groups("A,B,C,D,E"):
+            self.assertEqual(self.run_sel(edits)[0], base)
 
     # -- d) tests/*.py --------------------------------------------------------------------
     def test_d_inside_a_test_selects_that_test(self):

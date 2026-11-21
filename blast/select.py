@@ -19,6 +19,9 @@ Rules (docs/GUIDE_B_Selector.md, Stage B3):
     (recorded at docker build time). Tests are looked up by id in tests.json.
 A CHANGED file for which every lookup finds nothing -> FULL (never guess empty on code).
 
+SAFE_GROUPS (blast/safe.py) turns rule families back into FULL: B = class_users + name chain,
+C = map lines/def for runtime code, D = fixtures, E = DEAD lines / names that find nothing.
+
 '+' lines are also located in the NEW text: one that lands outside a def body (new module
 statement, class attribute, def header) is an import-time effect and goes through rule b.
 """
@@ -30,7 +33,7 @@ import json
 import os
 from pathlib import Path
 
-from blast import prover
+from blast import prover, safe
 from blast.fixtures import TestIndex
 from blast.locate import Loc, Locator, module_of, names_bound
 from blast.mapdb import MapDB
@@ -172,6 +175,8 @@ class _File:
                 return
             # a helper module (tests/helpers.py): follow the names it binds
         elif loc.classes:
+            if safe.on("B"):
+                raise Full(f"SAFE B: {path}:{loc.line} class body {'.'.join(loc.classes)}")
             for key in loc.class_keys(module_of(path)):
                 t = ctx.db.class_user_tests(key)
                 if t is None:
@@ -183,6 +188,8 @@ class _File:
         names = names_bound(loc.top)
         if names is None:
             raise Full(f"{path}:{loc.line} module-level statement binds no plain names")
+        if safe.on("B"):
+            raise Full(f"SAFE B: {path}:{loc.line} module-level names {','.join(names)}")
         for name in names:
             self.name_effect(name, depth)
 
@@ -210,19 +217,25 @@ class _File:
                         raise Full(f"{p}:{line} uses {name} in a def run at import")
                 else:
                     self.import_effect(p, loc, depth + 1)
+        if len(self.out) == before and safe.on("E"):
+            raise Full(f"SAFE E: name {name} adds no tests")
         self.note(f"b:name {name}+{len(self.out) - before}")
 
     # -- rules a-c for one changed ORIGINAL line ------------------------------------------
     def changed_line(self, loc: Loc) -> None:
         ctx, path = self.ctx, self.path
-        hit = self.add(ctx.db.line_tests(path, loc.stmt_lines), f"a:L{loc.line}")
         imp = ctx.db.import_lines(path)
+        if loc.kind == "def_body" and safe.on("C"):
+            raise Full(f"SAFE C: {path}:{loc.line} runtime line")
+        hit = self.add(ctx.db.line_tests(path, loc.stmt_lines), f"a:L{loc.line}")
         if loc.kind == "def_body":
             if any(n in imp for n in loc.stmt_lines):
                 raise Full(f"{path}:{loc.line} def body runs at import")
             if ctx.func_level:
                 hit |= self.add(ctx.db.line_tests(path, _def_lines(loc.func)), f"c:def {loc.func.name}")
             if not hit:
+                if safe.on("E"):
+                    raise Full(f"SAFE E: {path}:{loc.line} dead line")
                 self.note(f"DEAD L{loc.line}")
             return
         self.import_time = True  # module level, class body or def header
@@ -308,6 +321,8 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
                     f.note(f"g:import sqlglot+{len(ctx.subprocess_import_tests)}")
             trail.append(f"{v.path}: {' '.join(f.notes)}")
         elif v.kind == prover.DATA:
+            if safe.on("D"):
+                raise Full(f"SAFE D: {v.path}")
             t, rule = ctx.db.file_read_tests(v.path), "e:files_read"
             if not t and v.path.startswith("tests/fixtures/"):
                 t = frozenset(

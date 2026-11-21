@@ -13,7 +13,7 @@ import textwrap
 import unittest
 from pathlib import Path
 
-from blast import diff, prover
+from blast import diff, prover, safe
 from blast.tests.test_select import patch_for
 
 ROOT = Path(__file__).resolve().parent.parent.parent
@@ -104,6 +104,24 @@ class ProverEdgeCases(unittest.TestCase):
     def test_symlink_mode_change_is_full(self):
         [v] = self.verdicts("diff --git a/sqlglot/m.py b/sqlglot/m.py\nold mode 100644\nnew mode 120000\n")
         self.assertEqual(v.kind, prover.FULL)
+
+    # -- SAFE_GROUPS A ---------------------------------------------------------------------
+    def test_safe_a_turns_shortcuts_into_full_but_keeps_ast_equal(self):
+        docstring = patch_for("sqlglot/m.py", CODE, CODE.replace('"""Function doc."""', '"""Other."""'))
+        readme = patch_for("README.md", "# readme\n", "# readme!\n")
+        mode = "diff --git a/sqlglot/m.py b/sqlglot/m.py\nold mode 100644\nnew mode 100755\n"
+        comment = patch_for("sqlglot/m.py", CODE, CODE.replace("    A = 1\n", "    A = 1  # one\n"))
+        saved = safe.GROUPS
+        try:
+            safe.GROUPS = safe.parse("A")
+            for t in (docstring, readme, mode):
+                [v] = self.verdicts(t)
+                self.assertEqual(v.kind, prover.FULL, t)
+                self.assertIn("SAFE A", v.detail)
+            [v] = self.verdicts(comment)
+            self.assertEqual(v.kind, prover.NOOP)
+        finally:
+            safe.GROUPS = saved
 
     # -- line endings -----------------------------------------------------------------------
     def test_crlf_patch_and_missing_trailing_newline(self):

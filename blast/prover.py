@@ -21,6 +21,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from blast import safe
 from blast.apply import ApplyError, apply
 from blast.diff import FilePatch
 
@@ -32,6 +33,9 @@ _STRUCTURAL_PREFIXES = ("sqlglotrs/", "sqlglotc/", ".github/")
 _DOC_SUFFIXES = (".md", ".rst", ".png", ".gif", ".jpg", ".jpeg", ".svg")
 _DOC_NAMES = {"LICENSE", "LICENSE.md", "LICENSE.txt", "AUTHORS", "NOTICE"}
 _PLAIN_MODES = {"100644", "100755"}
+# NOOP details that are shortcuts (SAFE_GROUPS A), not proofs like "AST equal"
+_DOC_FILE, _MODE_ONLY, _DOCSTRINGS = "documentation file", "mode change only", "docstrings only"
+_SHORTCUTS = {_DOC_FILE, _MODE_ONLY, _DOCSTRINGS}
 _STRUCTURAL_NAMES = {"pyproject.toml", "setup.py", "setup.cfg", "MANIFEST.in", "Makefile",
                      "conftest.py", "requirements.txt", "tox.ini", "pytest.ini"}
 
@@ -84,6 +88,8 @@ def _parse(text: str, path: str) -> ast.AST:
 
 def classify(fp: FilePatch, src: Path = SRC) -> FileVerdict:
     v = _classify(fp, src)
+    if v.kind == NOOP and v.detail in _SHORTCUTS and safe.on("A"):
+        v = FileVerdict(FULL, v.path, f"SAFE A: {v.detail}")
     v.fp = fp
     return v
 
@@ -93,7 +99,7 @@ def _classify(fp: FilePatch, src: Path) -> FileVerdict:
     if _doc(fp.old_path if fp.old_path is not None else fp.new_path) and (
         fp.new_path is None or _doc(fp.new_path)
     ):
-        return FileVerdict(NOOP, path, "documentation file")
+        return FileVerdict(NOOP, path, _DOC_FILE)
     if fp.is_new:
         return FileVerdict(FULL, path, "new file")
     if fp.is_deleted:
@@ -103,7 +109,7 @@ def _classify(fp: FilePatch, src: Path) -> FileVerdict:
     if fp.is_binary:
         return FileVerdict(FULL, path, "binary")
     if not fp.hunks and fp.mode_change is not None and set(fp.mode_change) <= _PLAIN_MODES:
-        return FileVerdict(NOOP, path, f"mode {fp.mode_change[0]} -> {fp.mode_change[1]} only")
+        return FileVerdict(NOOP, path, _MODE_ONLY)
     if not fp.hunks:
         return FileVerdict(FULL, path, "no hunks (mode change?)")
     if _structural(path):
@@ -137,7 +143,7 @@ def _classify(fp: FilePatch, src: Path) -> FileVerdict:
     if ast.dump(_strip_docstrings(old_tree), include_attributes=False) == ast.dump(
         _strip_docstrings(new_tree), include_attributes=False
     ):
-        return FileVerdict(NOOP, path, "docstrings only")
+        return FileVerdict(NOOP, path, _DOCSTRINGS)
     return FileVerdict(CHANGED, path, f"lines {_ranges(changed)}", changed, fp, new_text)
 
 
