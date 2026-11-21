@@ -71,6 +71,14 @@ class MapDB:
         d = self._file_lines(path)
         return {d[n] for n in lines if n in d}
 
+    def file_lines(self, path: str) -> list[int]:
+        """Every line of `path` the map credits to some test."""
+        return sorted(self._file_lines(path))
+
+    def class_keys_of_module(self, module: str) -> list[str]:
+        prefix = module + ":"
+        return [k for k in self.class_users if k.startswith(prefix)]
+
     def line_tests(self, path: str, lines) -> frozenset[int] | None:
         """Union of the tests that ran any of `lines` during a test; None if none ran any."""
         d = self._file_lines(path)

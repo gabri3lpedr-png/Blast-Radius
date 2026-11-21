@@ -5,6 +5,8 @@
                             import aliases). Rule b) uses it to find who sees a module-level
                             name when its definition changes.
 <out>/test_strings.json.gz  [[test id, string literals]] for the fixture-name fallback.
+<out>/imports.json          static import graph (blast/imports.py): who imports whom, at
+                            import time or inside a def; defs that import dynamically.
 <out>/import_sqlglot.json   sorted source paths of the sqlglot modules a bare `import sqlglot`
                             loads (a fresh, isolated interpreter; sys.modules afterwards).
                             Tests that run `import sqlglot` in a subprocess use it.
@@ -26,6 +28,7 @@ from pathlib import Path
 sys.path[0] = str(Path(__file__).resolve().parent.parent)
 import subprocess  # noqa: E402 - after the fix above: subprocess imports `select`
 from blast.fixtures import TestIndex  # noqa: E402
+from blast import imports  # noqa: E402
 
 
 def build(src: Path) -> dict[str, dict[str, list[int]]]:
@@ -90,6 +93,8 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     _write(out / "name_index.json.gz", build(src))
     _write(out / "test_strings.json.gz", TestIndex(src)._build())
+    (out / "imports.json").write_text(json.dumps(imports.build(src), separators=(",", ":")), "utf-8")
+    print(f"wrote {out / 'imports.json'}", file=sys.stderr)
     mods = import_sqlglot_modules(src)
     (out / "import_sqlglot.json").write_text(json.dumps(mods), "utf-8")
     print(f"wrote {out / 'import_sqlglot.json'} ({len(mods)} modules)", file=sys.stderr)

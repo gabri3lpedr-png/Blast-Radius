@@ -17,7 +17,7 @@
   "pyproject": "FULL",
   "readme": "NOOP",
   "renamed": "FULL",
-  "syntax_error": "FULL",
+  "syntax_error": "MAP",
   "test_function": "MAP",
   "test_helper_module": "MAP"
 }

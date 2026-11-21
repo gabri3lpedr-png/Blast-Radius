@@ -22,4 +22,9 @@ RUN python /app/blast/build_index.py /opt/sqlglot /app/index \
 ENV SAFE_GROUPS=""
 # Rule s, setUpClass stopgap (blast/select.py): 1 on, 0 off. Map v3 credits class setup itself.
 ENV SETUP_STOPGAP="1"
+# Narrowing knobs (blast/select.py, blast/prover.py), measured on sample/ and mutants_out/:
+# FUNC_LEVEL 2 = hybrid line/def; SYNTAX_LAZY = rule x; IMPORT_FUNC, MODULE_NAMES, MAX_DEPTH = rule b
+# name chain; UNUSED_FILES = files the suite never runs. WIDE_NAMES and NOCU_NAMES stay off.
+ENV FUNC_LEVEL="2" SYNTAX_LAZY="1" IMPORT_FUNC="1" MODULE_NAMES="1" MAX_DEPTH="4" UNUSED_FILES="1" \
+    WIDE_NAMES="0" NOCU_NAMES="0"
 CMD ["python", "/app/selector.py"]

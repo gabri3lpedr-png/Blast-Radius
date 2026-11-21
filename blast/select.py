@@ -7,8 +7,10 @@ Rules (docs/GUIDE_B_Selector.md, Stage B3):
     every place in sqlglot/** and tests/** using those names (name index) -> their tests,
     recursively for uses that are themselves import-time. Cannot resolve -> FULL.
     A def body that runs at import time -> FULL (its effect can be anywhere).
- c) Inside a def, nothing found -> DEAD (nobody runs it). FUNC_LEVEL=1 (default): every line in
-    the enclosing def is looked up as well, for every changed line in a def.
+ c) Inside a def, nothing found -> DEAD (nobody runs it). FUNC_LEVEL=1: every line in the
+    enclosing def is looked up as well, for every changed line in a def. FUNC_LEVEL=2 (default,
+    hybrid): only when the changed statement itself found nothing, or the file's scope signature
+    changed (a name turned local/global/free, a def turned generator).
  d) tests/*.py: inside a test function -> that test (+ map lines); module level or helper ->
     all tests in the file + tests covering the helper.
  e) DATA files: files_read; nothing -> fixture name fallback (blast/fixtures.py); else FULL.
@@ -17,6 +19,13 @@ Rules (docs/GUIDE_B_Selector.md, Stage B3):
     order = collection order) and the map credits it to that test alone. So when a files_read
     set contains the first test of a class, every test of that class is added; for map lines,
     only when the line's test set holds that first test and no other test of the class.
+ x) SYNTAX_LAZY=1: a .py file whose new text does not parse (BROKEN) fails every import of it. Its
+    closure = itself + every file importing it at import time (blast/imports.py, recursively).
+    Any closure module loaded by `import sqlglot` -> FULL. Else: tests of closure test files, tests
+    the map credits with any line of a closure module, class_users of its classes, tests that ran
+    a def-level import of it, a dynamic-import def (importlib), or a use of its module basename /
+    class names as an attribute (`pkg.X` on a lazy package: sqlglot.optimizer, sqlglot.dialects),
+    + rule g tests. A use outside a def (outside the closure) -> FULL.
  g) Tests that run `import sqlglot` in a SUBPROCESS (the map cannot see them, e.g. test_lazy_load):
     added when a commit changes import-time code (module level, class body, def header) of a
     module that `import sqlglot` loads: IMPORT_SQLGLOT (hand list) union index/import_sqlglot.json
@@ -32,6 +41,7 @@ statement, class attribute, def header) is an import-time effect and goes throug
 
 from __future__ import annotations
 
+import ast
 import gzip
 import json
 import os
@@ -39,17 +49,40 @@ from pathlib import Path
 
 from blast import prover, safe
 from blast.fixtures import TestIndex
+from blast.imports import ImportGraph
 from blast.locate import Loc, Locator, module_of, names_bound
 from blast.mapdb import MapDB
 
 # Built at docker build time by blast/build_index.py (eval_sample.py builds it into .cache/).
 INDEX_DIR = Path(os.environ.get("INDEX_DIR", Path(__file__).resolve().parent.parent / "index"))
-FUNC_LEVEL = os.environ.get("FUNC_LEVEL", "1") != "0"
+# 0: changed statement only; 1: every line of the enclosing def; 2 (hybrid): the statement when
+# the map credits any test with it, else the def. 2 falls back to 1 for a file whose scope
+# signature changed (a name became local/global/free, a def became a generator...): such an
+# edit acts on lines other than its own.
+FUNC_LEVEL = int(os.environ.get("FUNC_LEVEL", "2") or "2")
 # Rule s (setUpClass stopgap) on/off. SETUP_STOPGAP=1 on, 0 off.
 SETUP_STOPGAP = os.environ.get("SETUP_STOPGAP", "1") != "0"
-MAX_DEPTH = 3
+# IMPORT_FUNC=1: a changed def body that runs at import time -> follow the def's name (its call
+# sites, rule b name chain; a call site inside another def run at import recurses) instead of FULL.
+IMPORT_FUNC = os.environ.get("IMPORT_FUNC", "1") == "1"
+MAX_DEPTH = int(os.environ.get("MAX_DEPTH", "4"))
 MAX_REF_FILES = 15  # a name used more widely than this -> FULL (cheaper than parsing it all)
 MAX_REF_LINES = 300
+# WIDE_NAMES=1: a name used more widely than the caps above is followed anyway; the commit goes FULL
+# only when the tests it selects take more than WIDE_FRACTION of all test time.
+WIDE_NAMES = os.environ.get("WIDE_NAMES", "0") == "1"
+WIDE_FRACTION = 0.6
+# UNUSED_FILES=1: a file the suite never runs contributes nothing: never imported (static graph,
+# no lazy loader) and the map saw none of its lines; or a test file none of whose tests is in
+# tests.json and that nothing imports (its own unlabelled tests are all it can break).
+UNUSED_FILES = os.environ.get("UNUSED_FILES", "1") == "1"
+# NOCU_NAMES=1: a class body change whose class has no class_users entry (never instantiated, nor
+# a subclass) follows the class name through rule b's name chain instead of FULL.
+NOCU_NAMES = os.environ.get("NOCU_NAMES", "0") == "1"
+# MODULE_NAMES=1: a module-level name bound in file D is looked up only where it can mean D's
+# binding: in D itself, as an attribute (x.NAME), or in a file that imports NAME (or *) from D.
+# Re-exports chain through rule b (the importing line binds NAME in the importer).
+MODULE_NAMES = os.environ.get("MODULE_NAMES", "1") == "1"
 
 # Rule g. Tests that run `import sqlglot` in a subprocess (ids, never numbers).
 SUBPROCESS_IMPORT_TESTS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
@@ -75,7 +108,7 @@ class Ctx:
         src: Path,
         db: MapDB,
         tests: list[dict],
-        func_level: bool = FUNC_LEVEL,
+        func_level: int = FUNC_LEVEL,
         index_dir: Path = INDEX_DIR,
         fixture_index: TestIndex | None = None,
         setup_stopgap: bool | None = None,
@@ -84,7 +117,7 @@ class Ctx:
             setup_stopgap = SETUP_STOPGAP
         self.src = src
         self.db = db
-        self.func_level = func_level
+        self.func_level = int(func_level)
         self.name_index_path = index_dir / "name_index.json.gz"
         self._names: dict | None = None
         self.fixtures = fixture_index or TestIndex(src, index_dir / "test_strings.json.gz")
@@ -104,6 +137,12 @@ class Ctx:
         } if setup_stopgap else {}
         self._setup_extra: dict[tuple[str, int], frozenset[int]] = {}
         self._loc: dict[str, Locator] = {}
+        self.ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
+        self.total_ms = sum(self.ms.values())
+        self._attr_lines: dict[str, dict[str, set[int]]] = {}
+        self._from_imports: dict[str, dict[str, set[str]]] = {}
+        self.imports_path = index_dir / "imports.json"
+        self._imports: ImportGraph | None = None
         self.import_sqlglot = _import_sqlglot(index_dir / "import_sqlglot.json")
         self.subprocess_import_tests = frozenset(
             self.number_by_id[i] for i in SUBPROCESS_IMPORT_TESTS if i in self.number_by_id
@@ -158,6 +197,66 @@ class Ctx:
             self._loc[path] = loc
         return loc
 
+    def _scan(self, path: str) -> None:
+        tree = self.locator(path).tree
+        attrs: dict[str, set[int]] = {}
+        froms: dict[str, set[str]] = {}  # imported module -> names (as bound here; "*" = star)
+        is_pkg = path.endswith("__init__.py")
+        mod = module_of(path)
+        here = mod if is_pkg else mod.rpartition(".")[0]
+        for n in ast.walk(tree):
+            if isinstance(n, ast.Attribute):
+                attrs.setdefault(n.attr, set()).add(n.end_lineno)
+            elif isinstance(n, ast.ImportFrom):
+                if n.level:
+                    base = here.split(".")
+                    if n.level > 1:
+                        base = base[: len(base) - (n.level - 1)]
+                    src_mod = ".".join(base + ([n.module] if n.module else []))
+                else:
+                    src_mod = n.module or ""
+                for a in n.names:
+                    if a.asname and a.asname != a.name:
+                        froms.setdefault(src_mod, set()).add(f"{a.name} as {a.asname}")
+                    else:
+                        froms.setdefault(src_mod, set()).add(a.name)
+        self._attr_lines[path] = attrs
+        self._from_imports[path] = froms
+
+    def ref_means(self, path: str, line: int, name: str, origin: str) -> bool:
+        """MODULE_NAMES: can the use of `name` at path:line be origin's module-level binding?"""
+        if path == origin:
+            return True
+        if path not in self._attr_lines:
+            self._scan(path)
+        if line in self._attr_lines[path].get(name, ()):
+            return True
+        names = self._from_imports[path].get(module_of(origin), set())
+        if "*" in names or name in names:
+            return True
+        if any(n.startswith(f"{name} as ") for n in names):
+            raise Full(f"{path} imports {name} from {origin} under another name")
+        return False
+
+    def unused(self, path: str) -> bool:
+        if not UNUSED_FILES:
+            return False
+        g = self.imports()
+        if not path.endswith(".py") or not path.startswith(("sqlglot/", "tests/")):
+            return False
+        name = path.rsplit("/", 1)[-1]
+        if path.startswith("tests/") and name.startswith("test_") and not self.tests_by_file.get(path):
+            return not (g.top_importers.get(path) or g.lazy_sites.get(path))
+        return g.never_imported(path) and not self.db.has_file(path) and not self.loaded_by_import_sqlglot(path)
+
+    def imports(self) -> ImportGraph:
+        if self._imports is None:
+            try:
+                self._imports = ImportGraph(self.imports_path)
+            except (OSError, ValueError, KeyError, TypeError) as e:
+                raise Full(f"no import graph ({type(e).__name__})") from e
+        return self._imports
+
     def name_refs(self, name: str) -> dict[str, list[int]]:
         if self._names is None:
             try:
@@ -177,6 +276,39 @@ def _import_sqlglot(path: Path) -> frozenset[str]:
     except (OSError, ValueError) as e:
         return frozenset({"<unknown>", *IMPORT_SQLGLOT, f"<error {type(e).__name__}>"})
     return IMPORT_SQLGLOT | frozenset(recorded)
+
+
+def scope_signature(text: str, path: str) -> list:
+    """Per function scope (walk order): how each name binds + generator/coroutine-ness."""
+    import symtable
+
+    out: list = []
+
+    def walk(t, trail):
+        if t.get_type() != "module":
+            syms = tuple(sorted(
+                (s.get_name(), s.is_parameter(), s.is_local(), s.is_global(), s.is_declared_global(),
+                 s.is_nonlocal(), s.is_free())
+                for s in t.get_symbols()
+            ))
+            out.append((trail, t.get_type(), syms))
+        for c in t.get_children():
+            walk(c, trail + (c.get_name(),))
+
+    walk(symtable.symtable(text, path, "exec"), ())
+    tree = ast.parse(text.encode("utf-8"), filename=path)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            stack, gen = list(ast.iter_child_nodes(node)), False
+            while stack:
+                n = stack.pop()
+                if isinstance(n, (ast.Yield, ast.YieldFrom, ast.Await)):
+                    gen = True
+                    break
+                if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+                    stack.extend(ast.iter_child_nodes(n))
+            out.append(("gen", gen))
+    return out
 
 
 def _added_new_lines(fp) -> list[int]:
@@ -202,8 +334,24 @@ class _File:
         self.ctx, self.path = ctx, path
         self.out: set[int] = set()
         self.notes: list[str] = []
-        self._seen_names: set[str] = set()
+        self._seen_names: set = set()
+        self.wide = False  # WIDE_NAMES: a name past the caps was followed
         self.import_time = False  # rule g: this file's own import-time code changed
+        self.verdict: prover.FileVerdict | None = None
+        self._scopes_same: bool | None = None
+
+    def scopes_same(self) -> bool:
+        """FUNC_LEVEL=2 guard: old and new text have the same scope signature."""
+        if self._scopes_same is None:
+            try:
+                old = (self.ctx.src / self.path).read_bytes().decode("utf-8")
+                self._scopes_same = self.verdict is not None and scope_signature(old, self.path) == \
+                    scope_signature(self.verdict.new_text, self.path)
+            except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
+                self._scopes_same = False
+            if not self._scopes_same:
+                self.note("c:scope changed")
+        return self._scopes_same
 
     def note(self, s: str) -> None:
         if len(self.notes) < 12:
@@ -242,6 +390,11 @@ class _File:
                 raise Full(f"SAFE B: {path}:{loc.line} class body {'.'.join(loc.classes)}")
             for key in loc.class_keys(module_of(path)):
                 t = ctx.db.class_user_tests(key)
+                if t is None and NOCU_NAMES and loc.top is not None and names_bound(loc.top):
+                    self.note(f"b:no class_users {key.split(':')[1]}")
+                    for name in names_bound(loc.top):
+                        self.name_effect(name, depth, path)
+                    continue
                 if t is None:
                     raise Full(f"no class_users for {key}")
                 self.add(t, f"b:class {key.split(':')[1]}")
@@ -254,31 +407,50 @@ class _File:
         if safe.on("B"):
             raise Full(f"SAFE B: {path}:{loc.line} module-level names {','.join(names)}")
         for name in names:
-            self.name_effect(name, depth)
+            self.name_effect(name, depth, path)
 
-    def name_effect(self, name: str, depth: int) -> None:
-        if name in self._seen_names:
+    def import_func(self, path: str, func, depth: int) -> None:
+        """IMPORT_FUNC: def `func` of `path` runs at import time and its body changed."""
+        name = getattr(func, "name", None)
+        if not name or (name.startswith("__") and name.endswith("__")):
+            raise Full(f"{path}: def {name} runs at import, called implicitly")
+        self.note(f"i:def {name}")
+        self.name_effect(name, depth, path)
+
+    def name_effect(self, name: str, depth: int, origin: str | None = None) -> None:
+        key = (origin, name) if MODULE_NAMES and origin else name
+        if key in self._seen_names:
             return
-        self._seen_names.add(name)
+        self._seen_names.add(key)
         if depth >= MAX_DEPTH:
             raise Full(f"name chain too deep at {name}")
         ctx = self.ctx
         refs = ctx.name_refs(name)
+        if MODULE_NAMES and origin:
+            refs = {p: kept for p, lines in refs.items()
+                    if (kept := [n for n in lines if ctx.ref_means(p, n, name, origin)])}
         if len(refs) > MAX_REF_FILES or sum(len(v) for v in refs.values()) > MAX_REF_LINES:
-            raise Full(f"name {name} used too widely ({len(refs)} files)")
+            if not WIDE_NAMES:
+                raise Full(f"name {name} used too widely ({len(refs)} files)")
+            self.wide = True
         before = len(self.out)
+        found = False  # a lookup credited some test (maybe one already selected: re-exports)
         for p, lines in sorted(refs.items()):
+            if ctx.unused(p):
+                continue
             lp = ctx.locator(p)
             imp = ctx.db.import_lines(p)
             for line in lines:
                 loc = lp.locate(line)
-                self.map_lines(p, loc.stmt_lines, None)
+                found |= self.map_lines(p, loc.stmt_lines, None)
                 if loc.kind == "def_body":
                     if any(n in imp for n in loc.stmt_lines):
-                        raise Full(f"{p}:{line} uses {name} in a def run at import")
+                        if not IMPORT_FUNC:
+                            raise Full(f"{p}:{line} uses {name} in a def run at import")
+                        self.import_func(p, loc.func, depth + 1)
                 else:
                     self.import_effect(p, loc, depth + 1)
-        if len(self.out) == before and safe.on("E"):
+        if len(self.out) == before and not found and safe.on("E"):
             raise Full(f"SAFE E: name {name} adds no tests")
         self.note(f"b:name {name}+{len(self.out) - before}")
 
@@ -290,9 +462,14 @@ class _File:
             raise Full(f"SAFE C: {path}:{loc.line} runtime line")
         hit = self.map_lines(path, loc.stmt_lines, f"a:L{loc.line}")
         if loc.kind == "def_body":
-            if any(n in imp for n in loc.stmt_lines):
-                raise Full(f"{path}:{loc.line} def body runs at import")
-            if ctx.func_level:
+            at_import = any(n in imp for n in loc.stmt_lines)
+            if at_import:
+                if not IMPORT_FUNC:
+                    raise Full(f"{path}:{loc.line} def body runs at import")
+                self.import_time = True
+                self.import_func(path, loc.func, 0)
+                hit = True
+            if ctx.func_level == 1 or (ctx.func_level == 2 and (not hit or not self.scopes_same())):
                 hit |= self.map_lines(path, _def_lines(loc.func), f"c:def {loc.func.name}")
             if not hit:
                 if safe.on("E"):
@@ -303,6 +480,61 @@ class _File:
         if loc.kind == "def_header":
             self.map_lines(path, _def_lines(loc.func), f"b:def {loc.func.name}")
         self.import_effect(path, loc, 0)
+
+    # -- rule x: a file that no longer parses -----------------------------------------------
+    def broken(self) -> set[int]:
+        ctx, path = self.ctx, self.path
+        if "<unknown>" in ctx.import_sqlglot:
+            raise Full("no record of the modules `import sqlglot` loads")
+        g = ctx.imports()
+        closure = g.closure(path)
+        for x in sorted(closure):
+            if x.startswith("sqlglot/") and ctx.loaded_by_import_sqlglot(x):
+                raise Full(f"x: {path} breaks {x}, loaded by `import sqlglot`")
+        self.note(f"x:closure {len(closure)}")
+        names: set[str] = set()
+        for x in sorted(closure):
+            if x.startswith("tests/"):
+                self.add(ctx.tests_by_file.get(x), f"x:file {x.rsplit('/', 1)[-1]}")
+                continue
+            if not ctx.db.has_file(x):
+                raise Full(f"x: map has no lines for {x}")
+            self.map_lines(x, ctx.db.file_lines(x), f"x:lines {x.rsplit('/', 1)[-1]}")
+            mod = module_of(x)
+            for key in ctx.db.class_keys_of_module(mod):
+                self.add(ctx.db.class_user_tests(key), f"x:class {key.split(':')[1]}")
+            names.update(g.lazy_names.get(x, ()))  # lazy attribute access: sqlglot.dialects.X
+            for imp, line in g.lazy_sites.get(x, ()):
+                if imp in closure:
+                    continue
+                self.ref_site(imp, line, f"x:lazy {imp.rsplit('/', 1)[-1]}:{line}")
+        for name in sorted(names):
+            for p, lines in sorted(g.attr_refs.get(name, {}).items()):
+                if p in closure:
+                    continue
+                for line in lines:
+                    self.ref_site(p, line, None)
+            self.note(f"x:attr {name}")
+        for p, a, b in g.dynamic:
+            self.map_lines(p, range(a, b + 1), f"x:dynamic {p.rsplit('/', 1)[-1]}:{a}")
+        if self.ctx.subprocess_import_tests:
+            self.add(ctx.subprocess_import_tests, "x:lazy_load")
+        if not self.out and not path.startswith("tests/"):
+            raise Full(f"x: nothing imports {path}")
+        return self.out
+
+    def ref_site(self, p: str, line: int, tag: str | None) -> None:
+        """A use of a broken module outside its closure: runtime -> who ran it; else FULL."""
+        ctx = self.ctx
+        loc = ctx.locator(p).locate(line)
+        if loc.kind != "def_body":
+            if p.startswith("tests/") and ctx.tests_by_file.get(p):
+                self.add(ctx.tests_by_file[p], f"x:file {p.rsplit('/', 1)[-1]}")
+                return
+            raise Full(f"x: {p}:{line} uses the broken module at import time")
+        if any(n in ctx.db.import_lines(p) for n in loc.stmt_lines):
+            raise Full(f"x: {p}:{line} uses the broken module in a def run at import")
+        self.map_lines(p, loc.stmt_lines, tag)
 
     # -- rule d: a tests/*.py line -------------------------------------------------------
     def test_line(self, loc: Loc) -> None:
@@ -331,6 +563,10 @@ class _File:
 
     def run(self, v: prover.FileVerdict) -> set[int]:
         ctx, path = self.ctx, self.path
+        self.verdict = v
+        if ctx.unused(path):
+            self.note("u:unused file")
+            return self.out
         is_test = path.startswith("tests/")
         if not is_test:
             if not path.startswith("sqlglot/"):
@@ -370,16 +606,22 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
     """Union over CHANGED and DATA files, plus rule f. Raises Full."""
     out: set[int] = set()
     trail: list[str] = []
+    wide = False
     for v in verdicts:
         if v.kind == prover.CHANGED:
             f = _File(ctx, v.path)
             out |= f.run(v)
+            wide |= f.wide
             if f.import_time and v.path.startswith("sqlglot/"):
                 if "<unknown>" in ctx.import_sqlglot:
                     raise Full("no record of the modules `import sqlglot` loads")
                 if ctx.loaded_by_import_sqlglot(v.path) and ctx.subprocess_import_tests - out:
                     out |= ctx.subprocess_import_tests
                     f.note(f"g:import sqlglot+{len(ctx.subprocess_import_tests)}")
+            trail.append(f"{v.path}: {' '.join(f.notes)}")
+        elif v.kind == prover.BROKEN:
+            f = _File(ctx, v.path)
+            out |= f.broken()
             trail.append(f"{v.path}: {' '.join(f.notes)}")
         elif v.kind == prover.DATA:
             if safe.on("D"):
@@ -400,6 +642,11 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
             trail.append(f"{v.path}: {rule}+{len(t)}")
         elif v.kind != prover.NOOP:
             raise Full(f"{v}")
+    if wide:
+        share = sum(ctx.ms.get(n, 0) for n in out) / max(ctx.total_ms, 1)
+        if share > WIDE_FRACTION:
+            raise Full(f"wide name selects {share:.0%} of test time")
+        trail.append(f"w:{share:.0%}")
     if out:
         extra = set(ctx.db.failed_at_baseline)
         files = {ctx.file_of[n] for n in out if n in ctx.file_of}

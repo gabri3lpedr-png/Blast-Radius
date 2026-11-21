@@ -26,6 +26,10 @@ from blast.apply import ApplyError, apply
 from blast.diff import FilePatch
 
 NOOP, CHANGED, DATA, FULL = "NOOP", "CHANGED", "DATA", "FULL"
+# BROKEN: a .py file whose new text does not parse, so importing it raises. With SYNTAX_LAZY=1 the
+# selector narrows it to the tests that would import it (blast/select.py, rule x); else FULL.
+BROKEN = "BROKEN"
+SYNTAX_LAZY = os.environ.get("SYNTAX_LAZY", "1") == "1"
 
 SRC = Path(os.environ.get("SQLGLOT_SRC", "/opt/sqlglot"))
 
@@ -132,6 +136,8 @@ def _classify(fp: FilePatch, src: Path) -> FileVerdict:
     try:
         new_tree = _parse(new_text, path)
     except (SyntaxError, ValueError) as e:
+        if SYNTAX_LAZY and path.startswith(("sqlglot/", "tests/")):
+            return FileVerdict(BROKEN, path, f"new text does not parse: {e}")
         return FileVerdict(FULL, path, f"new text does not parse: {e}")
     try:
         old_tree = _parse(original, path)

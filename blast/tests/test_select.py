@@ -14,7 +14,7 @@ from pathlib import Path
 
 from contextlib import contextmanager
 
-from blast import build_index, diff, prover, safe
+from blast import build_index, diff, imports, prover, safe
 from blast import select as sel
 from blast.fixtures import TestIndex
 from blast.mapdb import MapDB
@@ -154,6 +154,7 @@ class RulesTest(unittest.TestCase):
         cls.index.mkdir()
         build_index._write(cls.index / "name_index.json.gz", build_index.build(cls.src))
         build_index._write(cls.index / "test_strings.json.gz", TestIndex(cls.src)._build())
+        (cls.index / "imports.json").write_text(json.dumps(imports.build(cls.src)), "utf-8")
         cls.import_mods = build_index.import_sqlglot_modules(cls.src)
         (cls.index / "import_sqlglot.json").write_text(json.dumps(cls.import_mods), "utf-8")
         files_of = {IDS[i]: IDS[i].split("::")[0] for i in range(len(IDS))}
@@ -205,6 +206,35 @@ class RulesTest(unittest.TestCase):
     # -- c) FUNC_LEVEL ------------------------------------------------------------------
     def test_c_func_level_widens_to_the_def(self):
         self.assertSelects({"sqlglot/mod.py": ("    y = x + 1\n", "    y = x + 2\n")}, {A, B, C, FLAKY})
+
+    def test_c_hybrid_line_level_when_the_statement_ran(self):
+        self.assertSelects({"sqlglot/mod.py": ("    y = x + 1\n", "    y = x + 2\n")}, {A, C, FLAKY}, func_level=2)
+
+    def test_c_hybrid_widens_when_the_scope_changes(self):
+        # LIMIT becomes a local of helper: line 6 now raises UnboundLocalError
+        trail = self.assertSelects(
+            {"sqlglot/mod.py": ("    y = x + 1\n", "    y = x + 1\n    LIMIT = 2\n")}, {A, B, C, FLAKY}, func_level=2
+        )
+        self.assertIn("c:scope changed", trail)
+
+    def test_x_broken_module_selects_its_importers(self):
+        old = prover.SYNTAX_LAZY
+        prover.SYNTAX_LAZY = True
+        try:
+            got, trail = self.run_sel({"sqlglot/mod.py": ("    y = x + 1\n", "    y = x +\n")})
+        finally:
+            prover.SYNTAX_LAZY = old
+        self.assertIn("x:closure", trail)
+        self.assertTrue({A, B, C} <= got, trail)  # tests/test_mod.py imports sqlglot.mod
+
+    def test_x_broken_module_loaded_by_import_sqlglot_is_full(self):
+        old = prover.SYNTAX_LAZY
+        prover.SYNTAX_LAZY = True
+        try:
+            with self.assertRaises(sel.Full):
+                self.run_sel({"sqlglot/eager.py": ("FLAG = 1\n", "FLAG = \n")})
+        finally:
+            prover.SYNTAX_LAZY = old
 
     def test_c_dead_line_alone_is_full(self):
         for fl in (False, True):

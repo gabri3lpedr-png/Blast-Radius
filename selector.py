@@ -55,7 +55,11 @@ def main() -> None:
         if ctx is None:
             db = mapdb.load(number_by_id)
             log(f"map {db.name}: {'EMPTY' if db.empty else 'loaded'}, {len(db.unmapped)} unmapped, "
-                f"FUNC_LEVEL={int(sel.FUNC_LEVEL)}, SETUP_STOPGAP={int(sel.SETUP_STOPGAP)}, "
+                f"FUNC_LEVEL={sel.FUNC_LEVEL}, SETUP_STOPGAP={int(sel.SETUP_STOPGAP)}, "
+                f"SYNTAX_LAZY={int(prover.SYNTAX_LAZY)}, IMPORT_FUNC={int(sel.IMPORT_FUNC)}, "
+                f"MODULE_NAMES={int(sel.MODULE_NAMES)}, MAX_DEPTH={sel.MAX_DEPTH}, "
+                f"UNUSED_FILES={int(sel.UNUSED_FILES)}, WIDE_NAMES={int(sel.WIDE_NAMES)}, "
+                f"NOCU_NAMES={int(sel.NOCU_NAMES)}, "
                 f"SAFE_GROUPS={safe.describe()}")
             ctx = sel.Ctx(SRC, db, tests)
         return ctx
