@@ -1,0 +1,16 @@
+# DEV-ONLY feasibility image (tools/runtime/verify.py): our image + requirements.lock + the
+# pinned sqlglot with byte-compiled .pyc, so a commit can be checked by running its tests.
+# Build from the repo root:  docker build -f tools/runtime/Dockerfile.verify -t blast-verify .
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -r /tmp/requirements.lock
+ADD https://github.com/tobymao/sqlglot/archive/eb11aec4be8cb2122afe713a4816662c3f0fb2fa.tar.gz /tmp/sqlglot.tgz
+COPY blast/srctree.py /tmp/srctree.py
+RUN python /tmp/srctree.py /tmp/sqlglot.tgz /opt/sqlglot \
+    && rm /tmp/sqlglot.tgz /tmp/srctree.py \
+    && python -m compileall -q /opt/sqlglot/sqlglot /opt/sqlglot/tests \
+    && chmod -R a+rX /opt/sqlglot
+COPY blast/ /app/blast/
+COPY tools/runtime/verify.py tools/mutants/label_plugin.py /verify/
+ENV SKIP_INTEGRATION=0 SQLGLOT_SRC=/opt/sqlglot PYTHONDONTWRITEBYTECODE=1
+CMD ["python", "/verify/verify.py"]
