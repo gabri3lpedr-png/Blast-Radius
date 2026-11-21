@@ -93,6 +93,15 @@ TEST_FIX = textwrap.dedent('''\
             pass
     ''')
 
+# INFECTION fixture: one comparison in a def body
+CMP = textwrap.dedent('''\
+    def pick(x):
+        if x < 3:
+            return 1
+        return 2
+    ''')
+# line: 1 def pick | 2 if x < 3 (Compare at col 7) | 3 return 1 | 4 return 2
+
 # ATTR_LEVEL fixture: class attributes and dict entries
 KINDS = textwrap.dedent('''\
     class Base:
@@ -164,6 +173,7 @@ class RulesTest(unittest.TestCase):
             "sqlglot/mod.py": MOD,
             "sqlglot/user.py": USER,
             "sqlglot/kinds.py": KINDS,
+            "sqlglot/cmp.py": CMP,
             "tests/__init__.py": "",
             "tests/test_mod.py": TEST_MOD,
             "tests/test_fix.py": TEST_FIX,
@@ -724,3 +734,72 @@ class HeavyHelpersTest(unittest.TestCase):
             self.assertTrue((dst / "top.txt").is_symlink())
             self.assertFalse((dst / "pkg").is_symlink())
             self.assertEqual((src / "pkg" / "a.py").read_text(), "A")
+
+
+class InfectionTest(RulesTest):
+    """INFECTION against a hand-made infection map."""
+
+    RAW = {**FAKE_MAP,
+           "lines": {**FAKE_MAP["lines"], "sqlglot/cmp.py": {"2": 1, "3": 0, "4": 2}},
+           "import_lines": {**FAKE_MAP["import_lines"], "sqlglot/cmp.py": [1]}}
+
+    def setUp(self):
+        self._saved = sel.INFECTION
+        sel.INFECTION = True
+        self._tmp2 = tempfile.TemporaryDirectory()
+        imap = {"tests": [IDS[A], IDS[B]], "sets": [[0, 1], [1], []], "failed": {},
+                "nodes": {"sqlglot/cmp.py:2:7:cmp": {"op": "Lt", "end": [2, 12], "exec": 0,
+                                                     "alt": {"LtE": 1, "Eq": 2}, "import_exec": False,
+                                                     "import_alt": []}}}
+        self.map_path = Path(self._tmp2.name) / "infection_map.json.gz"
+        import gzip
+        with gzip.open(self.map_path, "wt") as f:
+            json.dump(imap, f)
+
+    def tearDown(self):
+        sel.INFECTION = self._saved
+        self._tmp2.cleanup()
+
+    def run_cmp(self, old, new, map_path=None):
+        from blast import infection
+
+        ctx = self.ctx(func_level=2, raw=self.RAW)
+        ctx._infection = infection.InfectionMap(self.number_by_id, map_path or self.map_path)
+        orig = (self.src / "sqlglot/cmp.py").read_text("utf-8")
+        text = patch_for("sqlglot/cmp.py", orig, orig.replace(old, new))
+        verdicts = [prover.classify(fp, self.src) for fp in diff.parse(text)]
+        return sel.select(ctx, verdicts)
+
+    def test_drops_tests_where_the_new_operator_never_differs(self):
+        got, trail = self.run_cmp("x < 3", "x <= 3")
+        self.assertEqual(got, {B, FLAKY, C}, trail)  # A evaluated it, LtE never differed there
+        self.assertIn("i:L2 cmp->LtE -1", trail)
+
+    def test_operator_that_never_differs_drops_every_evaluator(self):
+        got, trail = self.run_cmp("x < 3", "x == 3")
+        self.assertEqual(got, set(), trail)
+
+    def test_node_not_in_map_keeps_everything(self):
+        got, trail = self.run_cmp("x < 3", "x > 3")  # Gt: no entry for that alternative -> differs nowhere
+        self.assertEqual(got, set(), trail)
+        got, trail = self.run_cmp("x < 3", "y < 3")  # operand change: not a single-operator change
+        self.assertEqual(got, {A, B, FLAKY, C}, trail)
+
+    def test_missing_map_keeps_everything(self):
+        got, trail = self.run_cmp("x < 3", "x <= 3", Path("/nonexistent.json.gz"))
+        self.assertEqual(got, {A, B, FLAKY, C}, trail)
+
+    def test_single_op_change(self):
+        from blast import infection
+
+        f = infection.single_op_change
+        self.assertEqual(f("if a < b:\n    pass\n", "if a <= b:  # c\n    pass\n"), (1, 3, "cmp", "LtE"))
+        self.assertEqual(f("x = a and b\n", "x = a or b\n"), (1, 4, "bool", "Or"))
+        self.assertIsNone(f("x = a < b\ny = c < d\n", "x = a <= b\ny = c <= d\n"))
+        self.assertIsNone(f("x = a < b\n", "x = a < c\n"))
+        self.assertIsNone(f("x = a < b < c\n", "x = a <= b < c\n"))
+        self.assertIsNone(f("x = a < b\n", "x = a < b\n"))
+
+    for _name in [n for n in dir(RulesTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name

@@ -46,4 +46,7 @@ ENV FUNC_LEVEL="2" SYNTAX_LAZY="1" IMPORT_FUNC="1" MODULE_NAMES="1" MAX_DEPTH="4
 # static = only drops that need no replay (no subprocess); 1 = also replay the cheap phase (the
 # board: replays saved 0 s and cost ~7.5 s CPU on the practice set); 0 = off.
 ENV HEAVY_REPLAY="static"
+# INFECTION (blast/infection.py, maps/infection_map.json.gz built by infect/make_infection_map.sh):
+# a one-operator change keeps only the tests where the new operator would change the outcome.
+ENV INFECTION="1"
 CMD ["python", "/app/selector.py"]

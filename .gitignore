@@ -4,3 +4,4 @@ mutants_out/
 .cache/
 __pycache__/
 mutants_new/
+infect_out/

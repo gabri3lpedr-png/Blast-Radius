@@ -52,6 +52,7 @@ class FileVerdict:
     lines: list[int] = field(default_factory=list)  # CHANGED only: original line numbers
     fp: FilePatch | None = field(default=None, repr=False)
     new_text: str = field(default="", repr=False)  # CHANGED only
+    trees: tuple | None = field(default=None, repr=False)  # CHANGED only: (old, new) ASTs, docstrings stripped
 
     def __str__(self) -> str:
         return f"{self.kind} {self.path}" + (f" ({self.detail})" if self.detail else "")
@@ -150,7 +151,7 @@ def _classify(fp: FilePatch, src: Path) -> FileVerdict:
         _strip_docstrings(new_tree), include_attributes=False
     ):
         return FileVerdict(NOOP, path, _DOCSTRINGS)
-    return FileVerdict(CHANGED, path, f"lines {_ranges(changed)}", changed, fp, new_text)
+    return FileVerdict(CHANGED, path, f"lines {_ranges(changed)}", changed, fp, new_text, (old_tree, new_tree))
 
 
 def _ranges(nums: list[int]) -> str:

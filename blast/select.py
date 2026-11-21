@@ -52,7 +52,7 @@ import json
 import os
 from pathlib import Path
 
-from blast import attrs, prover, safe
+from blast import attrs, infection, prover, safe
 from blast.fixtures import TestIndex
 from blast.imports import ImportGraph
 from blast.locate import Loc, Locator, module_of, names_bound
@@ -90,6 +90,11 @@ NOCU_NAMES = os.environ.get("NOCU_NAMES", "0") == "1"
 # Anything read at import time (attr_import / key_import), ambiguous, or unknown to the map ->
 # class_users as before.
 ATTR_LEVEL = os.environ.get("ATTR_LEVEL", "1") == "1"
+# INFECTION=1: a file whose only change is one operator of one Compare / BoolOp (blast/infection.py)
+# keeps, of the tests ITS rules selected that evaluated that node, only those where the new
+# operator would have changed the outcome at least once (maps/infection_map.json.gz). Tests that
+# never evaluated it, setUpClass extras (rule s) and every other rule's tests stay.
+INFECTION = os.environ.get("INFECTION", "1") == "1"
 # MODULE_NAMES=1: a module-level name bound in file D is looked up only where it can mean D's
 # binding: in D itself, as an attribute (x.NAME), or in a file that imports NAME (or *) from D.
 # Re-exports chain through rule b (the importing line binds NAME in the importer).
@@ -154,6 +159,7 @@ class Ctx:
         self._from_imports: dict[str, dict[str, set[str]]] = {}
         self.imports_path = index_dir / "imports.json"
         self.subclasses_path = index_dir / "subclasses.json"
+        self._infection: infection.InfectionMap | None = None
         self._subclasses: dict[str, list[str]] | None = None
         self._imports: ImportGraph | None = None
         self.import_sqlglot = _import_sqlglot(index_dir / "import_sqlglot.json")
@@ -262,6 +268,11 @@ class Ctx:
             return not (g.top_importers.get(path) or g.lazy_sites.get(path))
         return g.never_imported(path) and not self.db.has_file(path) and not self.loaded_by_import_sqlglot(path)
 
+    def infection(self) -> infection.InfectionMap:
+        if self._infection is None:
+            self._infection = infection.InfectionMap(self.number_by_id)
+        return self._infection
+
     def runtime_subclasses(self, key: str) -> set[str] | None:
         """Transitive subclasses of `key` from index/subclasses.json (every sqlglot module loaded at
         build time). None when the index is missing (caller falls back)."""
@@ -369,6 +380,7 @@ class _File:
         self.verdict: prover.FileVerdict | None = None
         self._scopes_same: bool | None = None
         self._attr_cache: dict[tuple[str, ...], frozenset[int] | None] = {}
+        self.s_extra: set[int] = set()  # rule s (setUpClass) additions: INFECTION keeps them
 
     # -- rule b': ATTR_LEVEL ------------------------------------------------------------------
     def attr_level(self, classes: list[str]) -> frozenset[int] | None:
@@ -456,6 +468,7 @@ class _File:
         base, extra = self.ctx.line_tests(path, lines)
         if base is None:
             return False
+        self.s_extra |= extra
         if tag is None:
             self.out |= base | extra
         else:
@@ -653,6 +666,33 @@ class _File:
         if not ctx.tests_by_file.get(path) and not self.out:
             raise Full(f"helper {path}:{loc.line} has no known users")
 
+    def infect(self, v: prover.FileVerdict) -> None:
+        """INFECTION: narrow this file's own selection when its change is one operator."""
+        ctx, path = self.ctx, self.path
+        if v.fp is None:
+            return
+        tags = [tag for h in v.fp.hunks for tag, _ in h.lines if tag in "+-"]
+        if tags.count("-") != 1 or tags.count("+") != 1 or v.trees is None or len(v.lines) != 1:
+            return  # an operator swap is one line out, one line in
+        added = _added_new_lines(v.fp)
+        if added != v.lines:
+            return  # the new line must sit where the old one was
+        change = infection.single_op_change_at(v.trees[0], v.trees[1], v.lines[0])
+        if change is None:
+            return
+        imap = ctx.infection()
+        if not imap.ok:
+            self.note("i:no infection map")
+            return
+        line, col, kind, new_op = change
+        executed, differs = imap.lookup(path, line, col, kind, new_op)
+        if executed is None:
+            self.note(f"i:L{line} keep ({differs})")
+            return
+        drop = (self.out & executed) - differs - self.s_extra
+        self.out -= drop
+        self.note(f"i:L{line} {kind}->{new_op} -{len(drop)}")
+
     def run(self, v: prover.FileVerdict) -> set[int]:
         ctx, path = self.ctx, self.path
         self.verdict = v
@@ -702,7 +742,10 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
     for v in verdicts:
         if v.kind == prover.CHANGED:
             f = _File(ctx, v.path)
-            out |= f.run(v)
+            f.run(v)
+            if INFECTION and v.path.startswith("sqlglot/") and v.path.endswith(".py"):
+                f.infect(v)
+            out |= f.out
             wide |= f.wide
             if f.import_time and v.path.startswith("sqlglot/"):
                 if "<unknown>" in ctx.import_sqlglot:
