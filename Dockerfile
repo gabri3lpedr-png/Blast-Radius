@@ -42,6 +42,7 @@ ENV SETUP_STOPGAP="1"
 # ATTR_LEVEL (rule b', needs map v4 attr_users/key_users) off until measured.
 ENV FUNC_LEVEL="2" SYNTAX_LAZY="1" IMPORT_FUNC="1" MODULE_NAMES="1" MAX_DEPTH="4" UNUSED_FILES="1" \
     WIDE_NAMES="0" NOCU_NAMES="0" ATTR_LEVEL="0"
-# HEAVY_REPLAY (blast/heavy.py): drop TestExecutor's TPC tests after replaying their cheap phase.
-ENV HEAVY_REPLAY="0"
+# HEAVY_REPLAY (blast/heavy.py, on: 0 misses on sample + 313 mutants): drop TestExecutor's TPC tests
+# when they provably cannot fail (static check, or a replay of their cheap phase).
+ENV HEAVY_REPLAY="1"
 CMD ["python", "/app/selector.py"]

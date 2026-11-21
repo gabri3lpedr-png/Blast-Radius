@@ -21,7 +21,7 @@ from blast.pack import duration_ms, pack  # noqa: E402
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 # HEAVY_REPLAY=1: drop TestExecutor's TPC tests when blast/heavy.py proves they cannot fail.
-HEAVY_REPLAY = os.environ.get("HEAVY_REPLAY", "0") == "1"
+HEAVY_REPLAY = os.environ.get("HEAVY_REPLAY", "1") == "1"
 TMP = Path(os.environ.get("TMPDIR", "/tmp"))
 SRC = Path(os.environ.get("SQLGLOT_SRC", "/opt/sqlglot"))
 
