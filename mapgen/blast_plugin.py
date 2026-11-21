@@ -195,6 +195,34 @@ def _patch_new_classes():
         stack.extend(cls.__subclasses__())
 
 
+# Dialect["teradata"] / Dialect.get("teradata") hand out the CLASS without
+# building an instance (e.g. build_formatted_time reads Teradata.TIME_MAPPING
+# from Presto's parser), so __init__ wrappers never see it. Record lookups too.
+def _wrap_dialect_lookup():
+    meta = type(_BASES[1]) if len(_BASES) > 1 and _BASES[1].__name__ == "Dialect" else None
+    if meta is None:
+        return
+    for name in ("__getitem__", "get"):
+        orig = meta.__dict__.get(name)
+        if orig is None:
+            continue
+
+        is_cm = isinstance(orig, classmethod)
+        func = orig.__func__ if is_cm else orig
+
+        def wrapper(cls, *a, __func=func, **k):
+            r = __func(cls, *a, **k)
+            if _current is not None and isinstance(r, type):
+                _types[_current].add(r)
+            return r
+
+        wrapper.__wrapped__ = func
+        setattr(meta, name, classmethod(wrapper) if is_cm else wrapper)
+
+
+_wrap_dialect_lookup()
+
+
 def _key(cls):
     return f"{cls.__module__}:{cls.__qualname__}"
 
@@ -220,13 +248,52 @@ def pytest_runtest_protocol(item, nextitem):
     _files.setdefault(nid, set())
     _types.setdefault(nid, set())
     _patch_new_classes()
-    _current = nid
-    _cov.switch_context(nid)
+    _phase(nid)
     try:
         yield
     finally:
         _cov.switch_context("")
         _current = None
+
+
+# setUpClass / module fixtures run inside the FIRST test's setup and
+# tearDownClass inside the LAST test's teardown, yet they serve the whole class
+# (TestExecutor.setUpClass reads tpc-h.sql for test_optimized_tpch). Record the
+# setup/teardown phases under "setup@<nodeid>" / "teardown@<nodeid>";
+# export_map.py credits them to every test of that class (or module).
+def _phase(key):
+    global _current
+    _current = key
+    _files.setdefault(key, set())
+    _types.setdefault(key, set())
+    _cov.switch_context(key)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_setup(item):
+    _phase("setup@" + item.nodeid)
+    try:
+        yield
+    finally:
+        _phase(item.nodeid)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_teardown(item, nextitem):
+    _phase("teardown@" + item.nodeid)
+    try:
+        yield
+    finally:
+        _phase(item.nodeid)
+
+
+def _scope_tests(key):
+    """'setup@a::B::c' -> every seen test in a::B; a plain node id -> itself."""
+    if "@" not in key.split("::")[0]:
+        return [key]
+    nid = key.split("@", 1)[1]
+    scope = nid.rsplit("::", 1)[0] + "::"
+    return [t for t in _seen_tests if t.startswith(scope)] or [nid]
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -239,13 +306,16 @@ def pytest_unconfigure(config):
     _cov.stop()
     _cov.save()
     class_users = {}
-    for nid in _seen_tests:
-        for k in _expand(_types[nid]):
-            class_users.setdefault(k, set()).add(nid)
+    files_read = {}
+    for key in _types:
+        owners = _scope_tests(key)
+        for k in _expand(_types[key]):
+            class_users.setdefault(k, set()).update(owners)
+        for p in _files.get(key, ()):
+            files_read.setdefault(p, set()).update(owners)
     extra = {
         "tests": _seen_tests,
-        "files_read": {p: sorted(n for n in _files if p in _files[n])
-                       for p in sorted(set().union(*_files.values()) if _files else [])},
+        "files_read": {p: sorted(v) for p, v in sorted(files_read.items())},
         "class_users": {k: sorted(v) for k, v in sorted(class_users.items())},
         "failed": _failed,
         "meta": {

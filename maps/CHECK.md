@@ -1,7 +1,8 @@
-# Map check (tools/check_map.py on map v2)
+# Map check (tools/check_map.py on map v3)
 
-Naive selector: union of every test the map links to the change. Grades the MAP, not the real selector.
+Naive selector: union of every test the map links to the change; a patched .py that no longer compiles, module-level import-only code, or a new/unread file -> FALLBACK (run all). Grades the MAP, not the real selector.
 
+## sample/ (30 commits)
 ```
 commit kind      #sel   sel s #fail  MISS  note
 2haz   code        86    30.8     0  no    
@@ -10,7 +11,7 @@ commit kind      #sel   sel s #fail  MISS  note
 2vdj   fixture      1     0.1     1  no    
 3utz   code        37    35.0    37  no    
 4d63   code       273    10.2     0  no    
-535z   code       170    14.5     1  no    
+535z   code       171    14.5     1  no    
 5y72   code         3     0.5     0  no    
 66ks   code        51    22.8     0  no    
 6vvp   fixture      1     0.0     1  no    
@@ -36,4 +37,9 @@ rszg   multi     1620   103.0     3  no    FALLBACK sqlglot/optimizer/scope.py:1
 st8f   fixture      1     0.0     1  no    
 
 commits: 30   commits with a MISS: 0   fallbacks (run all): 4   total selected seconds: 579.5
+```
+
+## mutants_out/ (labelled mutants, dev-only, not in git)
+```
+commits: 189   commits with a MISS: 0   fallbacks (run all): 50   total selected seconds: 6718.8
 ```

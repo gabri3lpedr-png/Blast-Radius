@@ -59,6 +59,38 @@ def parse_patch(text):
     return files
 
 
+def patched_sources(text):
+    """-> {path: new source} for every existing .py file the patch edits."""
+    out, path, hunks = {}, None, {}
+    cur = None
+    for line in text.splitlines():
+        if line.startswith("--- "):
+            p = line[4:].split("\t")[0]
+            path = p[2:] if p.startswith("a/") else None if p == "/dev/null" else p
+            continue
+        if line.startswith("+++ "):
+            continue
+        m = HUNK.match(line)
+        if m and path:
+            cur = [int(m.group(1)), int(m.group(2) or 1), []]
+            hunks.setdefault(path, []).append(cur)
+            continue
+        if cur is not None and line[:1] in (" ", "+"):
+            cur[2].append(line[1:])
+    for path, hs in hunks.items():
+        if not path.endswith(".py"):
+            continue
+        try:
+            old = open(os.path.join(SRC, path)).read().split("\n")
+        except OSError:
+            continue
+        for start, count, new in sorted(hs, reverse=True):
+            i = start - 1 if count else start
+            old[i:i + count] = new
+        out[path] = "\n".join(old)
+    return out
+
+
 @lru_cache(maxsize=None)
 def scopes(path):
     """-> list of (start, end, kind, qualname) for every class/def in the file."""
@@ -113,6 +145,13 @@ def main():
         failing = set(ans["failing"])
         patch = open(os.path.join(SAMPLE, "commits", f"{cid}.patch")).read()
         selected, why_fb = set(), []
+        # A .py file that no longer compiles breaks every importer; no line map
+        # can say who those are, so the selector should run everything.
+        for path, src in patched_sources(patch).items():
+            try:
+                compile(src, path, "exec")
+            except SyntaxError:
+                why_fb.append(f"syntax error {path}")
         for path, lines in parse_patch(patch).items():
             if path.startswith("NEW:"):
                 why_fb.append(f"new file {path[4:]}")
@@ -156,8 +195,10 @@ def main():
         note = ("FALLBACK " + "; ".join(sorted(set(why))[:2])) if fb else ""
         print(f"{cid:6} {kind:8} {n:5d} {sec:7.1f} {nf:5d}  {miss:4}  {note}")
         if missed:
+            shown = sorted(missed)[:6]
             print("         missed: " + ", ".join(
-                f"{t} {tj['tests'][t]['id']}" for t in sorted(missed)))
+                f"{t} {tj['tests'][t]['id']}" for t in shown)
+                + (f" ... (+{len(missed) - 6})" if len(missed) > 6 else ""))
     print(f"\ncommits: {len(rows)}   commits with a MISS: {tot_miss}   "
           f"fallbacks (run all): {tot_fb}   total selected seconds: {tot_sec:.1f}")
     return 1 if tot_miss else 0
