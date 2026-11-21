@@ -1,0 +1,22 @@
+{
+  "bad_hunk_count": "FULL",
+  "binary": "NOOP",
+  "binary_fixture": "FULL",
+  "crlf": "MAP",
+  "deleted": "FULL",
+  "docstring_only": "NOOP",
+  "empty": "FULL",
+  "five_files": "MAP",
+  "fixture_unread": "FULL",
+  "garbage": "FULL",
+  "mode_change": "NOOP",
+  "new_py": "FULL",
+  "no_newline_at_eof": "NOOP",
+  "no_trailing_newline": "MAP",
+  "pyproject": "FULL",
+  "readme": "NOOP",
+  "renamed": "FULL",
+  "syntax_error": "FULL",
+  "test_function": "MAP",
+  "test_helper_module": "MAP"
+}

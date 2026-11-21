@@ -1,0 +1,21 @@
+diff --git a/sqlglot/dialects/dune.py b/sqlglot/dialects/dune.py
+deleted file mode 100644
+index f0349c1..0000000
+--- a/sqlglot/dialects/dune.py
++++ /dev/null
+@@ -1,15 +0,0 @@
+-from __future__ import annotations
+-
+-
+-from sqlglot.dialects.trino import Trino
+-from sqlglot.generators.dune import DuneGenerator
+-from sqlglot.parsers.dune import DuneParser
+-
+-
+-class Dune(Trino):
+-    Parser = DuneParser
+-
+-    class Tokenizer(Trino.Tokenizer):
+-        HEX_STRINGS = ["0x", ("X'", "'")]
+-
+-    Generator = DuneGenerator

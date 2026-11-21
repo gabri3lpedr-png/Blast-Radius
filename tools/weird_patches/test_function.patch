@@ -1,0 +1,13 @@
+diff --git a/tests/test_transpile.py b/tests/test_transpile.py
+index 7be62e6..a27be9a 100644
+--- a/tests/test_transpile.py
++++ b/tests/test_transpile.py
+@@ -22,7 +22,7 @@ class TestTranspile(unittest.TestCase):
+         self.assertEqual(transpile(sql, **kwargs)[0], target)
+ 
+     def test_weird_chars(self):
+-        self.assertEqual(transpile("0Êß")[0], "0 AS Êß")
++        self.assertEqual(transpile("0Êß")[0], "0 AS Êßx")
+         self.assertEqual(
+             # Ideographic space after SELECT (\u3000)
+             transpile("SELECT　* FROM t WHERE c = 1")[0],

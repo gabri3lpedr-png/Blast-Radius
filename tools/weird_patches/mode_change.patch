@@ -1,0 +1,3 @@
+diff --git a/sqlglot/optimizer/eliminate_joins.py b/sqlglot/optimizer/eliminate_joins.py
+old mode 100644
+new mode 100755

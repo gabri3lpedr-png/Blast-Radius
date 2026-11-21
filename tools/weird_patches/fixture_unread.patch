@@ -1,0 +1,9 @@
+diff --git a/tests/fixtures/jsonpath/LICENSE b/tests/fixtures/jsonpath/LICENSE
+index 212459f..3a860a7 100644
+--- a/tests/fixtures/jsonpath/LICENSE
++++ b/tests/fixtures/jsonpath/LICENSE
+@@ -13,3 +13,4 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ 
+ 
+ 
++extra line

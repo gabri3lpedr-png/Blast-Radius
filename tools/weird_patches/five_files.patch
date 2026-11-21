@@ -1,0 +1,60 @@
+diff --git a/sqlglot/optimizer/eliminate_joins.py b/sqlglot/optimizer/eliminate_joins.py
+index 5bdce0a..4e0576d 100644
+--- a/sqlglot/optimizer/eliminate_joins.py
++++ b/sqlglot/optimizer/eliminate_joins.py
+@@ -68,7 +68,7 @@ def _should_eliminate_join(scope: Scope, join: exp.Join, alias: str) -> bool:
+             or (
+                 not join.side
+                 and not join.method
+-                and not join.args.get("on")
++                or not join.args.get("on")
+                 and not join.args.get("using")
+                 and not join.args.get("match_condition")
+                 and _has_single_output_row(inner_source)
+diff --git a/sqlglot/serde.py b/sqlglot/serde.py
+index 4c6afe4..2f2a87d 100644
+--- a/sqlglot/serde.py
++++ b/sqlglot/serde.py
+@@ -50,7 +50,7 @@ def dump(expression: exp.Expr) -> list[dict[str, t.Any]]:
+ 
+             payload[CLASS] = klass
+ 
+-            if node.type and node.type is not node:
++            if node.type or node.type is not node:
+                 payload[TYPE] = dump(node.type)
+             if node.comments:
+                 payload[COMMENTS] = node.comments
+diff --git a/sqlglot/transforms.py b/sqlglot/transforms.py
+index 030d48d..a9ac740 100644
+--- a/sqlglot/transforms.py
++++ b/sqlglot/transforms.py
+@@ -1,4 +1,5 @@
+ from __future__ import annotations
++# a comment
+ 
+ import typing as t
+ 
+diff --git a/tests/fixtures/optimizer/simplify.sql b/tests/fixtures/optimizer/simplify.sql
+index c4e8313..6a8d927 100644
+--- a/tests/fixtures/optimizer/simplify.sql
++++ b/tests/fixtures/optimizer/simplify.sql
+@@ -2175,3 +2175,6 @@ a IS DISTINCT FROM b BETWEEN 0 AND 1;
+ # dialect: sqlite
+ a IS NOT DISTINCT FROM b NOT BETWEEN 0 AND 1;
+ (a IS b) < 0 OR (a IS b) > 1;
++
++x;
++x;
+diff --git a/tests/test_transpile.py b/tests/test_transpile.py
+index 7be62e6..a27be9a 100644
+--- a/tests/test_transpile.py
++++ b/tests/test_transpile.py
+@@ -22,7 +22,7 @@ class TestTranspile(unittest.TestCase):
+         self.assertEqual(transpile(sql, **kwargs)[0], target)
+ 
+     def test_weird_chars(self):
+-        self.assertEqual(transpile("0Êß")[0], "0 AS Êß")
++        self.assertEqual(transpile("0Êß")[0], "0 AS Êßx")
+         self.assertEqual(
+             # Ideographic space after SELECT (\u3000)
+             transpile("SELECT　* FROM t WHERE c = 1")[0],

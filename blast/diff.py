@@ -30,6 +30,8 @@ class FilePatch:
     is_deleted: bool = False
     is_binary: bool = False
     is_rename: bool = False
+    # (old mode, new mode) from "old mode"/"new mode" lines, else None
+    mode_change: tuple[str, str] | None = None
     hunks: list[Hunk] = field(default_factory=list)
 
     @property
@@ -168,6 +170,10 @@ def _parse(text: str) -> list[FilePatch]:
                 cur.is_new = True
             elif line.startswith("deleted file mode"):
                 cur.is_deleted = True
+            elif line.startswith("old mode "):
+                cur.mode_change = (line[len("old mode "):].strip(), (cur.mode_change or ("", ""))[1])
+            elif line.startswith("new mode "):
+                cur.mode_change = ((cur.mode_change or ("", ""))[0], line[len("new mode "):].strip())
             elif line.startswith("rename from "):
                 cur.is_rename = True
                 cur.old_path = _unquote(line[len("rename from "):])
