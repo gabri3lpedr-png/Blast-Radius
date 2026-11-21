@@ -13,5 +13,9 @@ ENV SQLGLOT_SRC=/opt/sqlglot
 
 COPY selector.py /app/selector.py
 COPY blast/ /app/blast/
-RUN chmod -R a+rX /app
+COPY maps/ /app/maps/
+# Name index (rule b) and fixture-name index, built from the pinned source.
+RUN python /app/blast/build_index.py /opt/sqlglot /app/index \
+    && rm -rf /app/blast/tests \
+    && chmod -R a+rX /app
 CMD ["python", "/app/selector.py"]

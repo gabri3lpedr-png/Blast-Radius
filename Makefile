@@ -11,7 +11,7 @@ RUN_FLAGS := --rm --platform linux/amd64 --network none --cpus 2 \
 	--volume "$(SAMPLE)/commits:/data/commits:ro" \
 	--volume "$(SAMPLE)/tests.json:/data/tests.json:ro"
 
-.PHONY: build sample check
+.PHONY: build sample check unit
 
 build:
 	docker build --platform linux/amd64 --tag $(IMAGE) .
@@ -27,3 +27,7 @@ sample: build
 check: build
 	docker run $(RUN_FLAGS) $(IMAGE) > "$(OUTPUT)"
 	python3 score.py "$(SAMPLE)" "$(SAMPLE)/answers.json" "$(OUTPUT)" > /dev/null && echo "format ok"
+
+# Selector rule tests (fake map, no Docker).
+unit:
+	python3 -m unittest discover -s blast/tests -t .

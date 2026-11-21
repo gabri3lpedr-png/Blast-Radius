@@ -9,6 +9,7 @@ Then runs score.py on the output for the official total.
 from __future__ import annotations
 
 import json
+import resource
 import os
 import subprocess
 import sys
@@ -41,18 +42,34 @@ def sqlglot_src() -> Path:
     return dest
 
 
+def index_dir(src: Path) -> Path:
+    """The selector's indexes, built once into .cache/index (the image builds them at docker
+    build). Delete .cache/index after changing blast/build_index.py."""
+    if "INDEX_DIR" in os.environ:
+        return Path(os.environ["INDEX_DIR"])
+    out = CACHE / "index"
+    if not (out / "test_strings.json.gz").exists():
+        subprocess.run([sys.executable, str(ROOT / "blast" / "build_index.py"), str(src), str(out)], check=True)
+    return out
+
+
 def main() -> int:
     data = Path(sys.argv[1] if len(sys.argv) > 1 else os.environ.get("DATA_DIR", ROOT / "sample"))
     data = data.resolve()
     answers_path = data / "answers.json"
     out_path = ROOT / "output.jsonl"
 
-    env = dict(os.environ, DATA_DIR=str(data), SQLGLOT_SRC=str(sqlglot_src()))
+    src = sqlglot_src()
+    env = dict(os.environ, DATA_DIR=str(data), SQLGLOT_SRC=str(src), INDEX_DIR=str(index_dir(src)))
+    ru0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu0 = ru0.ru_utime + ru0.ru_stime
     t0 = time.time()
     proc = subprocess.run(
         [sys.executable, str(ROOT / "selector.py")], env=env, capture_output=True, text=True
     )
     wall = time.time() - t0
+    ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = ru.ru_utime + ru.ru_stime - cpu0
     out_path.write_text(proc.stdout, "utf-8")
     if proc.returncode != 0:
         sys.stderr.write(proc.stderr)
@@ -61,6 +78,8 @@ def main() -> int:
 
     reasons: dict[str, str] = {}
     for line in proc.stderr.splitlines():
+        if line.startswith("map "):
+            print(line)
         commit, _, rest = line.partition(" ")
         if commit and rest:
             reasons.setdefault(commit, rest)
@@ -89,7 +108,7 @@ def main() -> int:
     for commit, kind, nsel, k, c, missing, nfail, reason in sorted(rows):
         miss = f"MISS({len(missing)})" if missing else ""
         print(f"{commit:6} {kind:8} {nsel:5d} {k:2d} {c / 1000:8.3f} {nfail:5d} {miss:5} {reason}")
-    print(f"\nours: total {total / 1000:.3f} s, {misses} misses, selector wall {wall:.2f} s\n")
+    print(f"\nours: total {total / 1000:.3f} s, {misses} misses, selector wall {wall:.2f} s, CPU {cpu:.2f} s\n")
 
     sys.stdout.flush()
     r = subprocess.run(
