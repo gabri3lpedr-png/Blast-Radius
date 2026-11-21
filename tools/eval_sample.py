@@ -19,6 +19,26 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from blast.pack import cost, duration_ms  # noqa: E402
+from blast.srctree import TARBALL_URL, extract  # noqa: E402
+
+CACHE = ROOT / ".cache"
+
+
+def sqlglot_src() -> Path:
+    """The pinned sqlglot source, downloaded and extracted once into .cache/ (git-ignored)."""
+    if "SQLGLOT_SRC" in os.environ:
+        return Path(os.environ["SQLGLOT_SRC"])
+    dest = CACHE / "sqlglot"
+    if not (dest / "sqlglot" / "__init__.py").exists():
+        import urllib.request
+
+        CACHE.mkdir(exist_ok=True)
+        tgz = CACHE / "sqlglot.tgz"
+        if not tgz.exists():
+            print(f"downloading {TARBALL_URL}", file=sys.stderr)
+            urllib.request.urlretrieve(TARBALL_URL, tgz)
+        extract(tgz, dest)
+    return dest
 
 
 def main() -> int:
@@ -27,7 +47,7 @@ def main() -> int:
     answers_path = data / "answers.json"
     out_path = ROOT / "output.jsonl"
 
-    env = dict(os.environ, DATA_DIR=str(data))
+    env = dict(os.environ, DATA_DIR=str(data), SQLGLOT_SRC=str(sqlglot_src()))
     t0 = time.time()
     proc = subprocess.run(
         [sys.executable, str(ROOT / "selector.py")], env=env, capture_output=True, text=True
