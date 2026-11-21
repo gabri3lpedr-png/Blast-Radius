@@ -3,6 +3,8 @@ in docs/GUIDE_A_MapMaker.md). Runs inside the mapgen image (needs coverage).
 
 Usage: python export_map.py <raw dir with .coverage + blast_extra.json> <out .json.gz>
 """
+import ast
+import functools
 import gzip
 import json
 import os
@@ -16,6 +18,38 @@ COMMIT = "eb11aec4be8cb2122afe713a4816662c3f0fb2fa"
 MAX_BYTES = 12 * 1024 * 1024
 
 
+def continuation_lines(path):
+    """{line: first line} for the 2nd..last lines of every multi-line statement.
+
+    Coverage reports a statement on its first line only, so an edit on line 174
+    of a multi-line tuple in a test would look like dead code. Simple statements
+    span lineno..end_lineno; compound ones (if/for/def/class/with) only their
+    header, up to the first body line. Docstrings are left alone.
+    """
+    try:
+        tree = ast.parse(open(path, encoding="utf-8").read())
+    except (SyntaxError, UnicodeDecodeError, OSError):
+        return {}
+    out = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.stmt) or node.end_lineno == node.lineno:
+            continue
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) \
+                and isinstance(node.value.value, str):
+            continue
+        end = node.end_lineno
+        body = getattr(node, "body", None)
+        if isinstance(body, list) and body:
+            end = body[0].lineno - 1
+        start = node.lineno
+        for dec in getattr(node, "decorator_list", []):
+            start = min(start, dec.lineno)
+        for ln in range(start, end + 1):
+            if ln != node.lineno:
+                out.setdefault(ln, node.lineno)
+    return out
+
+
 def main(raw, out_path):
     t0 = time.time()
     extra = json.load(open(os.path.join(raw, "blast_extra.json")))
@@ -23,6 +57,15 @@ def main(raw, out_path):
     index = {t: i for i, t in enumerate(tests)}
 
     sets, set_ids = [], {}
+
+    @functools.lru_cache(maxsize=None)
+    def scope_tests(ctx):
+        """'setup@a::B::c' -> every test in a::B (see blast_plugin._phase)."""
+        if "@" not in ctx.split("::")[0]:
+            return (ctx,)
+        nid = ctx.split("@", 1)[1]
+        scope = nid.rsplit("::", 1)[0] + "::"
+        return tuple(t for t in tests if t.startswith(scope)) or (nid,)
 
     def set_of(node_ids):
         key = tuple(sorted({index[n] for n in node_ids if n in index}))
@@ -39,12 +82,15 @@ def main(raw, out_path):
             continue
         rel = path[len(ROOT):]
         by_line = data.contexts_by_lineno(path)
+        for ln, first in continuation_lines(path).items():
+            if ln not in by_line and first in by_line:
+                by_line[ln] = by_line[first]
         file_lines, file_imports = {}, []
         for lineno in sorted(by_line):
             ctxs = by_line[lineno]
             if "" in ctxs:
                 file_imports.append(lineno)
-            in_tests = [c for c in ctxs if c]
+            in_tests = [t for c in ctxs if c for t in scope_tests(c)]
             if in_tests:
                 file_lines[str(lineno)] = set_of(in_tests)
         if file_lines:
