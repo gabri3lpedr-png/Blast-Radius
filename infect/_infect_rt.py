@@ -8,6 +8,7 @@ b1 / bv / be    a BoolOp in a boolean context whose later operands are names/con
                 change the outcome or what gets evaluated.
 `cur` is the current context's {nid: bitmask of differing alternatives}; presence = executed.
 """
+import enum
 import operator
 import sys
 import types
@@ -58,6 +59,33 @@ def _safe(x, depth=2) -> bool:
     return _builtin_methods(t) and not hasattr(x, "__len__") and not hasattr(x, "__iter__")
 
 
+EQ_FAMILY = (1 << 0) | (1 << 1) | IDENTITY  # ==, !=, is, is not
+_SINGLETONS = (None, True, False, NotImplemented, Ellipsis)
+_eq_types = {}
+
+
+def _eq_builtin(t) -> bool:
+    """t's == / != are not written in Python (object's, the Enum default, str's for str-mixin enums...)."""
+    r = _eq_types.get(t)
+    if r is None:
+        r = not any(isinstance(getattr(t, n, None), types.FunctionType) for n in ("__eq__", "__ne__"))
+        _eq_types[t] = r
+    return r
+
+
+def _eq_safe(x) -> bool:
+    """An identity-equal kind of value whose == / != run no user code: enum members, None/True/
+    False/NotImplemented/Ellipsis, classes, functions, modules (and the builtin scalars)."""
+    if any(x is s for s in _SINGLETONS):
+        return True
+    t = type(x)
+    if t in _SCALARS:
+        return True
+    if isinstance(x, (enum.Enum, type, types.FunctionType, types.BuiltinFunctionType, types.ModuleType)):
+        return _eq_builtin(t)
+    return False
+
+
 def c(nid, a, b):
     op = NODE_OP[nid]
     try:
@@ -79,8 +107,12 @@ def c(nid, a, b):
         alts = full & ~m
         if alts:
             if not (_safe(a) and _safe(b)):
-                m |= alts & ~IDENTITY  # only identity checks run no user code
-                alts &= IDENTITY
+                if _eq_safe(a) and _eq_safe(b):
+                    m |= alts & ~EQ_FAMILY  # == != is is-not run no user code here; the rest might
+                    alts &= EQ_FAMILY
+                else:
+                    m |= alts & ~IDENTITY  # only identity checks run no user code
+                    alts &= IDENTITY
             i = 0
             while alts:
                 if alts & 1:
@@ -108,13 +140,17 @@ def _plain_truth(v) -> bool:
                 or isinstance(getattr(t, "__len__", None), types.FunctionType))
 
 
+PURE: dict = {}  # nid -> tuple: operand i is side-effect-free by syntax (the swap may skip it)
+
+
 def b1(nid, v):
     ok = _plain_truth(v)
-    _stack.setdefault(nid, []).append([id(sys._getframe(1)), bool(v) if ok else None, ok])
+    # [frame, truth of the first operand, all truth checks builtin, an impure later operand ran]
+    _stack.setdefault(nid, []).append([id(sys._getframe(1)), bool(v) if ok else None, ok, False])
     return v
 
 
-def bv(nid, v):
+def bv(nid, i, v):
     st = _stack.get(nid)
     if st:
         f = id(sys._getframe(1))
@@ -122,11 +158,18 @@ def bv(nid, v):
             if e[0] == f:
                 if not _plain_truth(v):
                     e[2] = False
+                if not PURE[nid][i]:
+                    e[3] = True
                 break
     return v
 
 
 def be(nid, res):
+    """The swap and <-> or changes nothing only if (a) every truth check was builtin, (b) it needs
+    no operand the original did not evaluate, (c) the operands it would skip are side-effect-free,
+    (d) the outcome is the same. With t1 = truth of the first operand: and -> or keeps the outcome
+    iff t1 and the and-result are truthy (or then stops at the first operand, skipping the rest);
+    or -> and iff t1 and the or-result are falsy. Otherwise the swap needs an unevaluated operand."""
     st = _stack.get(nid)
     f = id(sys._getframe(1))
     entry = None
@@ -138,14 +181,14 @@ def be(nid, res):
     if entry is None:
         cur[nid] = 1
         return res
-    _, t1, ok = entry
-    if not ok or not _plain_truth(res):
+    _, t1, ok, impure_ran = entry
+    if not ok or impure_ran or not _plain_truth(res):
         differs = True
     else:
         truth = bool(res)
-        if NODE_OP[nid] == 0:  # and -> or: same only if the first is truthy and so is the result
+        if NODE_OP[nid] == 0:  # and -> or
             differs = not t1 or not truth
-        else:  # or -> and: same only if the first is falsy and so is the result
+        else:  # or -> and
             differs = t1 or truth
     cur[nid] = cur.get(nid, 0) | (1 if differs else 0)
     return res

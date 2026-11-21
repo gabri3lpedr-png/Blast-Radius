@@ -37,8 +37,27 @@ def _bool_context(tree) -> set:
     return out
 
 
+_PURE_CALLS = {"isinstance", "issubclass"}
+
+
 def _pure(e) -> bool:
-    return isinstance(e, (ast.Name, ast.Constant))
+    """Side-effect-free by syntax (assumes attribute reads, constant subscripts and comparisons
+    run no side effects, which holds for sqlglot's properties and comparisons)."""
+    if isinstance(e, (ast.Name, ast.Constant)):
+        return True
+    if isinstance(e, ast.Attribute):
+        return _pure(e.value)
+    if isinstance(e, ast.Subscript):
+        return _pure(e.value) and isinstance(e.slice, ast.Constant)
+    if isinstance(e, ast.UnaryOp):
+        return _pure(e.operand)
+    if isinstance(e, ast.Compare):
+        return _pure(e.left) and all(_pure(c) for c in e.comparators)
+    if isinstance(e, ast.BoolOp):
+        return all(_pure(v) for v in e.values)
+    if isinstance(e, ast.Call) and isinstance(e.func, ast.Name) and e.func.id in _PURE_CALLS:
+        return not e.keywords and all(_pure(a) for a in e.args)
+    return False
 
 
 class _Tx(ast.NodeTransformer):
@@ -67,13 +86,16 @@ class _Tx(ast.NodeTransformer):
         return self._call("c", [ast.Constant(nid), node.left, node.comparators[0]], node)
 
     def visit_BoolOp(self, node):
-        target = id(node) in self.boolctx and all(_pure(v) for v in node.values[1:])
+        target = id(node) in self.boolctx
         nid = self._reg(node, "bool", 0 if isinstance(node.op, ast.And) else 1) if target else None
+        if target:
+            rt.PURE[nid] = tuple(_pure(v) for v in node.values)  # judged on the ORIGINAL operands
         self.generic_visit(node)
         if not target:
             return node
         vals = [self._call("b1", [ast.Constant(nid), node.values[0]], node.values[0])]
-        vals += [self._call("bv", [ast.Constant(nid), v], v) for v in node.values[1:]]
+        vals += [self._call("bv", [ast.Constant(nid), ast.Constant(i), v], v)
+                 for i, v in enumerate(node.values[1:], start=1)]
         inner = ast.copy_location(ast.BoolOp(op=node.op, values=vals), node)
         return self._call("be", [ast.Constant(nid), inner], node)
 
