@@ -39,9 +39,9 @@ ENV SETUP_STOPGAP="1"
 # Narrowing knobs (blast/select.py, blast/prover.py), measured on sample/ and mutants_out/:
 # FUNC_LEVEL 2 = hybrid line/def; SYNTAX_LAZY = rule x; IMPORT_FUNC, MODULE_NAMES, MAX_DEPTH = rule b
 # name chain; UNUSED_FILES = files the suite never runs. WIDE_NAMES and NOCU_NAMES stay off;
-# ATTR_LEVEL (rule b', needs map v4 attr_users/key_users) off until measured.
+# ATTR_LEVEL (rule b', map v4 attr_users/key_users): on, 0 misses on sample + 313 mutants.
 ENV FUNC_LEVEL="2" SYNTAX_LAZY="1" IMPORT_FUNC="1" MODULE_NAMES="1" MAX_DEPTH="4" UNUSED_FILES="1" \
-    WIDE_NAMES="0" NOCU_NAMES="0" ATTR_LEVEL="0"
+    WIDE_NAMES="0" NOCU_NAMES="0" ATTR_LEVEL="1"
 # HEAVY_REPLAY (blast/heavy.py, on: 0 misses on sample + 313 mutants): drop TestExecutor's TPC tests
 # when they provably cannot fail (static check, or a replay of their cheap phase).
 ENV HEAVY_REPLAY="1"

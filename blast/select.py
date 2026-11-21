@@ -89,7 +89,7 @@ NOCU_NAMES = os.environ.get("NOCU_NAMES", "0") == "1"
 # (key_users[key] | key_users["*"]), for the class and every subclass key in the map (rule b').
 # Anything read at import time (attr_import / key_import), ambiguous, or unknown to the map ->
 # class_users as before.
-ATTR_LEVEL = os.environ.get("ATTR_LEVEL", "0") == "1"
+ATTR_LEVEL = os.environ.get("ATTR_LEVEL", "1") == "1"
 # MODULE_NAMES=1: a module-level name bound in file D is looked up only where it can mean D's
 # binding: in D itself, as an attribute (x.NAME), or in a file that imports NAME (or *) from D.
 # Re-exports chain through rule b (the importing line binds NAME in the importer).
@@ -153,6 +153,8 @@ class Ctx:
         self._attr_lines: dict[str, dict[str, set[int]]] = {}
         self._from_imports: dict[str, dict[str, set[str]]] = {}
         self.imports_path = index_dir / "imports.json"
+        self.subclasses_path = index_dir / "subclasses.json"
+        self._subclasses: dict[str, list[str]] | None = None
         self._imports: ImportGraph | None = None
         self.import_sqlglot = _import_sqlglot(index_dir / "import_sqlglot.json")
         self.subprocess_import_tests = frozenset(
@@ -259,6 +261,22 @@ class Ctx:
         if path.startswith("tests/") and name.startswith("test_") and not self.tests_by_file.get(path):
             return not (g.top_importers.get(path) or g.lazy_sites.get(path))
         return g.never_imported(path) and not self.db.has_file(path) and not self.loaded_by_import_sqlglot(path)
+
+    def runtime_subclasses(self, key: str) -> set[str] | None:
+        """Transitive subclasses of `key` from index/subclasses.json (every sqlglot module loaded at
+        build time). None when the index is missing (caller falls back)."""
+        if self._subclasses is None:
+            try:
+                self._subclasses = json.loads(self.subclasses_path.read_text("utf-8"))["subclasses"]
+            except (OSError, ValueError, KeyError):
+                return None
+        out, todo = set(), [key]
+        while todo:
+            for s in self._subclasses.get(todo.pop(), ()):
+                if s not in out:
+                    out.add(s)
+                    todo.append(s)
+        return out
 
     def imports(self) -> ImportGraph:
         if self._imports is None:
@@ -378,10 +396,11 @@ class _File:
         if diff is None:
             return None
         cls_key = f"{module_of(self.path)}:{'.'.join(classes)}"
-        subs = ctx.imports().subclasses(cls_key)
-        if subs is None:
+        subs = ctx.imports().subclasses(cls_key)  # by base name, static (over-includes)
+        loaded = ctx.runtime_subclasses(cls_key)  # __subclasses__ with every module imported
+        if subs is None or loaded is None:
             return None
-        owners = [cls_key, *subs]
+        owners = [cls_key, *sorted(set(subs) | loaded)]
         out: set[int] = set()
         for name in sorted(diff.whole):
             bases = [f"{c}.{name}" for c in owners]
@@ -395,8 +414,9 @@ class _File:
                 out |= db.tests_of_set(i)
         for name, spellings in sorted(diff.keys.items()):
             bases = [f"{c}.{name}" for c in owners]
-            if any(b in db.attr_import for b in bases):
-                return None
+            # a dict read at import (attr_import) is fine: what matters is whether its keys were
+            # used then, K[*] or K[changed key] in key_import (Person A, map v4 note 2:
+            # _Dialect.__new__ reads every generator's TRANSFORMS at import to pop JSONPath keys)
             look = [f"{b}[{k}]" for b in bases for k in sorted(spellings | {"*"})]
             if any(k in db.key_import for k in look):
                 return None

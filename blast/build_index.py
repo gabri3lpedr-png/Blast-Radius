@@ -7,6 +7,10 @@
 <out>/test_strings.json.gz  [[test id, string literals]] for the fixture-name fallback.
 <out>/imports.json          static import graph (blast/imports.py): who imports whom, at
                             import time or inside a def; defs that import dynamically.
+<out>/subclasses.json       "module:qualname" -> direct subclasses ("module:qualname"), from
+                            __subclasses__() after importing EVERY module under sqlglot/ (a fresh,
+                            isolated interpreter; __main__ skipped): a class only lists the
+                            subclasses that are loaded. ATTR_LEVEL (rule b') reads it.
 <out>/import_sqlglot.json   sorted source paths of the sqlglot modules a bare `import sqlglot`
                             loads (a fresh, isolated interpreter; sys.modules afterwards).
                             Tests that run `import sqlglot` in a subprocess use it.
@@ -82,6 +86,49 @@ def import_sqlglot_modules(src: Path) -> list[str]:
     return mods
 
 
+_SUBCLASS_PROBE = """
+import importlib, json, os, pkgutil, sys
+src = os.path.realpath(sys.argv[1])
+sys.path.insert(0, src)
+import sqlglot
+failed = []
+for info in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+    if info.name.split(".")[-1] == "__main__":
+        continue
+    try:
+        importlib.import_module(info.name)
+    except Exception as e:  # an optional module that cannot load here cannot load in a test either
+        failed.append(f"{info.name}: {type(e).__name__}")
+def key(c):
+    return f"{c.__module__}:{c.__qualname__}"
+out, seen, todo = {}, set(), [object]
+while todo:
+    c = todo.pop()
+    try:
+        subs = type.__subclasses__(c) if isinstance(c, type) else []
+    except TypeError:
+        subs = []
+    for s in subs:
+        if s.__module__.startswith("sqlglot") and c.__module__.startswith("sqlglot"):
+            out.setdefault(key(c), set()).add(key(s))
+        if s not in seen:
+            seen.add(s)
+            todo.append(s)
+print(json.dumps({"subclasses": {k: sorted(v) for k, v in sorted(out.items())}, "failed": failed}))
+"""
+
+
+def subclass_index(src: Path, require_generator: bool = True) -> dict:
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", _SUBCLASS_PROBE, str(src)],
+        capture_output=True, text=True, check=True, cwd=str(src),
+    )
+    rec = json.loads(proc.stdout.strip().splitlines()[-1])
+    if require_generator and not rec["subclasses"].get("sqlglot.generator:Generator"):
+        raise RuntimeError("subclass probe found no Generator subclasses")
+    return rec
+
+
 def _write(path: Path, data) -> None:
     with gzip.open(path, "wt", encoding="utf-8", compresslevel=9) as f:
         json.dump(data, f, separators=(",", ":"))
@@ -95,6 +142,10 @@ def main() -> None:
     _write(out / "test_strings.json.gz", TestIndex(src)._build())
     (out / "imports.json").write_text(json.dumps(imports.build(src), separators=(",", ":")), "utf-8")
     print(f"wrote {out / 'imports.json'}", file=sys.stderr)
+    sub = subclass_index(src)
+    (out / "subclasses.json").write_text(json.dumps(sub, separators=(",", ":")), "utf-8")
+    print(f"wrote {out / 'subclasses.json'} ({len(sub['subclasses'])} classes with subclasses, "
+          f"{len(sub['failed'])} modules failed to import: {sub['failed'][:5]})", file=sys.stderr)
     mods = import_sqlglot_modules(src)
     (out / "import_sqlglot.json").write_text(json.dumps(mods), "utf-8")
     print(f"wrote {out / 'import_sqlglot.json'} ({len(mods)} modules)", file=sys.stderr)

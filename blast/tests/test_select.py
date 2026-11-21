@@ -176,6 +176,8 @@ class RulesTest(unittest.TestCase):
         build_index._write(cls.index / "name_index.json.gz", build_index.build(cls.src))
         build_index._write(cls.index / "test_strings.json.gz", TestIndex(cls.src)._build())
         (cls.index / "imports.json").write_text(json.dumps(imports.build(cls.src)), "utf-8")
+        (cls.index / "subclasses.json").write_text(
+            json.dumps(build_index.subclass_index(cls.src, require_generator=False)), "utf-8")
         cls.import_mods = build_index.import_sqlglot_modules(cls.src)
         (cls.index / "import_sqlglot.json").write_text(json.dumps(cls.import_mods), "utf-8")
         files_of = {IDS[i]: IDS[i].split("::")[0] for i in range(len(IDS))}
@@ -594,9 +596,29 @@ class AttrLevelTest(RulesTest):
         self.assertEqual(got, CLASS_USERS, trail)
         self.assertIn("fallback", trail)
 
-    def test_attr_read_at_import_in_a_subclass_falls_back(self):
-        raw = {**ATTR_MAP, "attr_import": [_K + "Sub.TABLE"]}
+    def test_dict_read_at_import_does_not_fall_back(self):
+        # map v4 note 2: a bare import read of a dict (attr_import) is not a key use
+        raw = {**ATTR_MAP, "attr_import": [_K + "Sub.TABLE", _K + "Base.TABLE"]}
         got, trail = self.sel_kinds('        "a": 1,\n', '        "a": 9,\n', raw)
+        self.assertEqual(got, {A, FIX, B, FLAKY, C}, trail)
+
+    def test_dict_iterated_at_import_in_a_subclass_falls_back(self):
+        raw = {**ATTR_MAP, "key_import": [_K + "Sub.TABLE[*]"]}
+        got, trail = self.sel_kinds('        "a": 1,\n', '        "a": 9,\n', raw)
+        self.assertEqual(got, CLASS_USERS, trail)
+
+    def test_scalar_read_at_import_falls_back(self):
+        raw = {**ATTR_MAP, "attr_import": [_K + "Sub.NAME"]}
+        got, trail = self.sel_kinds('    NAME = "base"\n', '    NAME = "other"\n', raw)
+        self.assertEqual(got, CLASS_USERS, trail)
+
+    def test_missing_runtime_subclass_index_falls_back(self):
+        ctx = self.ctx(raw=ATTR_MAP)
+        ctx.subclasses_path = Path("/nonexistent/subclasses.json")
+        orig = (self.src / "sqlglot/kinds.py").read_text("utf-8")
+        text = patch_for("sqlglot/kinds.py", orig, orig.replace('        "a": 1,\n', '        "a": 9,\n'))
+        verdicts = [prover.classify(fp, self.src) for fp in diff.parse(text)]
+        got, trail = sel.select(ctx, verdicts)
         self.assertEqual(got, CLASS_USERS, trail)
 
     def test_ambiguous_key_falls_back(self):
