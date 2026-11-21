@@ -1,6 +1,6 @@
-# Map check (tools/check_map.py on map v3)
+# Map check (tools/check_map.py on map v4)
 
-Naive selector: union of every test the map links to the change; a patched .py that no longer compiles, module-level import-only code, or a new/unread file -> FALLBACK (run all). Grades the MAP, not the real selector.
+Naive selector: union of every test the map links to the change; a patched .py that no longer compiles, module-level import-only code, or a new/unread file -> FALLBACK (run all). Grades the MAP, not the real selector. `--v4` also uses attr_users/key_users for class-body attribute edits (see mapgen/README.md).
 
 ## sample/ (30 commits)
 ```
@@ -39,7 +39,11 @@ st8f   fixture      1     0.0     1  no
 commits: 30   commits with a MISS: 0   fallbacks (run all): 4   total selected seconds: 579.5
 ```
 
-## mutants_out/ (labelled mutants, dev-only, not in git)
+## mutants_out/ (313 labelled mutants, dev-only, not in git)
 ```
-commits: 189   commits with a MISS: 0   fallbacks (run all): 50   total selected seconds: 6718.8
+classic: commits: 313   commits with a MISS: 0   fallbacks (run all): 84   total selected seconds: 11086.6
+--v4:    commits: 313   commits with a MISS: 0   fallbacks (run all): 84   total selected seconds: 10733.3
+--v4 on sample: commits: 30   commits with a MISS: 0   fallbacks (run all): 4   total selected seconds: 579.5
 ```
+
+--v4 gains (selected seconds): dialect_attr 459 -> 285 (28 mutants), table_entry 367 -> 266 (32 mutants), no new misses.
