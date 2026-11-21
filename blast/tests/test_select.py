@@ -218,6 +218,14 @@ class RulesTest(unittest.TestCase):
         with self.assertRaises(sel.Full):
             self.run_sel({"sqlglot/mod.py": ("LIMIT = 10\n", "LIMIT = 10\nprint('import-time')\n")})
 
+    def test_b_import_only_file_is_mapped(self):
+        # a module whose code only runs at import has import_lines but no "lines" (tsql.py)
+        raw = dict(FAKE_MAP, lines={k: v for k, v in FAKE_MAP["lines"].items() if k != "sqlglot/mod.py"})
+        trail = self.assertSelects(
+            {"sqlglot/mod.py": ('    KIND = "a"\n', '    KIND = "b"\n')}, {OTHER, FLAKY}, raw=raw
+        )
+        self.assertIn("b:class Thing", trail)
+
     def test_b_class_without_class_users_is_full(self):
         raw = dict(FAKE_MAP, class_users={})
         with self.assertRaises(sel.Full):

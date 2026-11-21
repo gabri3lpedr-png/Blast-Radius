@@ -62,7 +62,9 @@ class MapDB:
         return d
 
     def has_file(self, path: str) -> bool:
-        return path in self._lines_raw
+        """The map measured this file. A module whose code all runs at import (tsql.py: only
+        class bodies) has import_lines but no per-test "lines"; it is mapped all the same."""
+        return path in self._lines_raw or path in self._import_raw
 
     def line_tests(self, path: str, lines) -> frozenset[int] | None:
         """Union of the tests that ran any of `lines` during a test; None if none ran any."""
