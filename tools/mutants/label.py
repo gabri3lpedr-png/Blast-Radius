@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Label mutant patches by running sqlglot's REAL test suite (DEV-ONLY).
 
-Usage (repo root):  python3 tools/mutants/label.py [--jobs 4] [--limit N]
+Usage (repo root):  python3 tools/mutants/label.py [--jobs 3] [--limit N] [--dir mutants_new]
 
 For each mutants_out/pending/<id>.patch not labelled yet: copy pristine sqlglot
 (.cache/sqlglot) to mutants_out/work, `git apply` the patch, run the full suite
@@ -32,6 +32,7 @@ PRISTINE = os.path.join(REPO, ".cache", "sqlglot")
 IMAGE = "blast-radius-mapgen"
 CONTAINER = "blast-label"
 RUN_TIMEOUT = 45 * 60  # whole suite, seconds
+TEST_TIMEOUT = 300     # per test (pytest-timeout), --test-timeout
 
 
 def log(msg):
@@ -60,7 +61,7 @@ def pytest_run(tag, args, timeout):
            "--volume", f"{RAW}:/out",
            "--env", "PYTHONPATH=/opt/sqlglot:/mutants", "--env", f"LABEL_OUT=/out/{tag}",
            IMAGE, "python", "-m", "pytest", *args, "-p", "label_plugin", "-p", "no:cacheprovider",
-           "-q", "--timeout", "300"]
+           "-q", "--timeout", str(TEST_TIMEOUT)]
     try:
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -138,7 +139,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jobs", type=int, default=3)
     ap.add_argument("--limit", type=int, default=0, help="label at most N patches this run")
+    ap.add_argument("--dir", default="mutants_out",
+                    help="set folder (repo-relative): mutants_out, mutants_new, ...")
+    ap.add_argument("--test-timeout", type=int, default=300, help="pytest-timeout per test, seconds")
     args = ap.parse_args()
+    global MO, PENDING, COMMITS, RAW, WORK, TEST_TIMEOUT
+    MO = os.path.join(REPO, args.dir)
+    PENDING, COMMITS, RAW, WORK = (os.path.join(MO, d) for d in ("pending", "commits", "raw", "work"))
+    TEST_TIMEOUT = args.test_timeout
     for d in (PENDING, COMMITS, RAW):
         os.makedirs(d, exist_ok=True)
 
