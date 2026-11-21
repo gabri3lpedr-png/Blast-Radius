@@ -47,3 +47,14 @@ classic: commits: 313   commits with a MISS: 0   fallbacks (run all): 84   total
 ```
 
 --v4 gains (selected seconds): dialect_attr 459 -> 285 (28 mutants), table_entry 367 -> 266 (32 mutants), no new misses.
+
+## mutants_new/ (100 generalisation mutants, new kinds, dev-only, not in git)
+```
+--v4: commits: 100   commits with a MISS: 0   fallbacks (run all): 18   total selected seconds: 2664.9
+```
+
+Kinds: multi-line edits, deleted statements/returns, swapped args, renamed locals,
+new methods/dict entries, default args, tests/ edits, fixture line add/remove,
+executor/optimizer/typing/jsonpath/time.py edits, 3-5-file combos.
+check_map's patch parser now counts hunk lengths, so a removed fixture line
+starting with "-- " (shown as "--- ...") is no longer read as a file header.

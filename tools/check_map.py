@@ -31,25 +31,63 @@ SRC = ARGS[2] if len(ARGS) > 2 else ".cache/sqlglot"
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
+def _tag(text):
+    """Yield (kind, line): kind is "---", "+++", "@@" or "body".
+
+    Inside a hunk, lines are counted against its old/new lengths, so a removed
+    line whose text starts with "-- " (a SQL comment in a fixture) is body,
+    not a "--- " file header.
+    """
+    left_old = left_new = 0
+    for line in text.splitlines():
+        if left_old > 0 or left_new > 0:
+            c = line[:1]
+            if c == "-":
+                left_old -= 1
+            elif c == "+":
+                left_new -= 1
+            elif c in (" ", ""):
+                left_old -= 1
+                left_new -= 1
+            elif c == "\\":
+                pass
+            else:
+                left_old = left_new = 0  # malformed: fall through to headers
+            if c in "-+ \\" or c == "":
+                yield "body", line
+                continue
+        m = HUNK.match(line)
+        if m:
+            left_old = 1 if m.group(2) is None else int(m.group(2))
+            left_new = 1 if m.group(4) is None else int(m.group(4))
+            yield "@@", line
+        elif line.startswith("--- "):
+            yield "---", line
+        elif line.startswith("+++ "):
+            yield "+++", line
+        else:
+            yield "other", line
+
+
 def parse_patch(text):
     """-> {old_path: set(original line numbers touched)}; None path = new file."""
     files, path, old = {}, None, 0
-    for line in text.splitlines():
-        if line.startswith("--- "):
+    for kind, line in _tag(text):
+        if kind == "---":
             p = line[4:].split("\t")[0]
             path = None if p == "/dev/null" else p[2:] if p.startswith("a/") else p
             continue
-        if line.startswith("+++ "):
+        if kind == "+++":
             if path is None:
                 newp = line[4:].split("\t")[0]
                 path = "NEW:" + (newp[2:] if newp.startswith("b/") else newp)
             files.setdefault(path, set())
             continue
-        m = HUNK.match(line)
+        m = HUNK.match(line) if kind == "@@" else None
         if m:
             old = int(m.group(1))
             continue
-        if path is None or not line or line.startswith(("diff ", "index ", "\\")):
+        if path is None or kind != "body" or not line or line.startswith("\\"):
             continue
         if line[0] == "-":
             files[path].add(old)
@@ -65,19 +103,19 @@ def patched_sources(text):
     """-> {path: new source} for every existing .py file the patch edits."""
     out, path, hunks = {}, None, {}
     cur = None
-    for line in text.splitlines():
-        if line.startswith("--- "):
+    for kind, line in _tag(text):
+        if kind == "---":
             p = line[4:].split("\t")[0]
             path = p[2:] if p.startswith("a/") else None if p == "/dev/null" else p
             continue
-        if line.startswith("+++ "):
+        if kind == "+++":
             continue
-        m = HUNK.match(line)
+        m = HUNK.match(line) if kind == "@@" else None
         if m and path:
             cur = [int(m.group(1)), int(m.group(2) or 1), []]
             hunks.setdefault(path, []).append(cur)
             continue
-        if cur is not None and line[:1] in (" ", "+"):
+        if cur is not None and kind == "body" and line[:1] in (" ", "+"):
             cur[2].append(line[1:])
     for path, hs in hunks.items():
         if not path.endswith(".py"):
