@@ -64,10 +64,39 @@ Person A delivers **`maps/coverage_map.json.gz`** (gzip JSON):
   "import_lines": { "sqlglot/parser.py": [1, 2, 5, 40] },             // lines run outside any test (import time)
   "files_read": { "tests/fixtures/optimizer/simplify.sql": 12 },      // non-.py files opened during tests -> set index
   "class_users": { "sqlglot.dialects.tsql:TSQL": 7 },                 // "module:qualname" (MRO-expanded) -> set index
+  // map v4 (optional; the selector's ATTR_LEVEL rule uses them, older maps simply lack them):
+  "attr_users": { "sqlglot.generators.tsql:TSQLGenerator.TRANSFORMS": 9 },       // class attribute read during a test -> set index
+  "key_users":  { "sqlglot.generators.tsql:TSQLGenerator.TRANSFORMS[Anonymous]": 10,
+                  "sqlglot.generators.tsql:TSQLGenerator.TRANSFORMS[*]": 11 },    // dict key looked up / whole dict iterated
+  "attr_import": [ "sqlglot.generator:Generator.TRANSFORMS" ],                   // same keys, read at IMPORT time (no test)
+  "key_import":  [ "sqlglot.generator:Generator.TRANSFORMS[*]" ],
   "failed_at_baseline": [],
   "meta": {}
 }
 ```
+- **map v4 keys (attr_users, key_users, attr_import, key_import).** Recorded for class attributes of
+  sqlglot classes (Dialect, Tokenizer, Parser, Generator and their nested classes at least).
+  - The class in the key is the class the attribute was **looked up on**: `type(obj)` for a read through
+    an instance (`self.TRANSFORMS` on a TSQLGenerator -> `...:TSQLGenerator.TRANSFORMS`, even though the
+    dict is inherited), the class object itself for a read through a class. `module:qualname` as in
+    class_users (`sqlglot.dialects.trino:Trino.Tokenizer`), then `.ATTR`.
+  - `attr_users[K]`: tests during which attribute K was **read** at all (any getattr that resolves to a
+    class attribute, inherited or not; also hasattr). Every read, not just the first: no caching.
+  - `key_users[K[key]]`: tests during which dict attribute K was asked about `key`: `d[key]`, `d.get(key)`,
+    `key in d`, `d.setdefault/pop(key)`, **hits and misses alike** (a test that looked up a key that is not
+    there breaks when the key is added).
+  - `key_users[K[*]]`: tests that touched the dict as a whole: iteration, `keys/values/items`, `len`, `bool`,
+    `copy`, `**d`, `d | x`, `==`, `repr`, passing it to `dict()`/`update()`; and any lookup of a key that
+    cannot be spelled (below). The selector always adds `[*]` to a key lookup.
+  - Key spelling: Enum member -> `"<type(k).__qualname__>.<k.name>"` (check Enum BEFORE str: AutoName
+    members are str); class -> `k.__qualname__` (`Anonymous`, `DataType.Type`); str/int/float/bool/None/bytes
+    -> `repr(k)` (`'ARRAY_AGG'`, `1`); anything else -> record under `[*]`.
+  - `attr_import` / `key_import`: the same keys, for reads that happened at import time (outside any test,
+    e.g. `{**Generator.TRANSFORMS, ...}` in a subclass body, a metaclass or `__init_subclass__` building a
+    trie from KEYWORDS). The instrumentation must be installed before sqlglot is imported. A key listed
+    here makes the selector fall back to class_users for that attribute.
+  - A class-body edit whose attribute (for the class and every subclass) has no key at all in these maps
+    falls back to class_users: missing keys are never read as "nobody uses it".
 - Paths are repo-relative with `/`. Convert ids → numbers with `/data/tests.json` at runtime (never hard-code numbers).
 - **Until A delivers, create `maps/stub_map.json.gz`** with the same keys and empty values; the selector loads
   `coverage_map.json.gz` if it exists, else the stub. **Any lookup that finds nothing → FULL run.** That keeps

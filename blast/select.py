@@ -26,6 +26,11 @@ Rules (docs/GUIDE_B_Selector.md, Stage B3):
     a def-level import of it, a dynamic-import def (importlib), or a use of its module basename /
     class names as an attribute (`pkg.X` on a lazy package: sqlglot.optimizer, sqlglot.dialects),
     + rule g tests. A use outside a def (outside the closure) -> FULL.
+ b') ATTR_LEVEL=1 (map v4): a class-body edit is diffed (blast/attrs.py, old vs new text) into the
+    attributes it changes and, for dict literals, the keys. Each attribute -> attr_users, each dict
+    entry -> key_users[key] | key_users["*"], over the class and every subclass (by base name,
+    index/imports.json "classes"). Read at import (attr_import / key_import), ambiguous, or no
+    such key in the map -> class_users (rule b) as before.
  g) Tests that run `import sqlglot` in a SUBPROCESS (the map cannot see them, e.g. test_lazy_load):
     added when a commit changes import-time code (module level, class body, def header) of a
     module that `import sqlglot` loads: IMPORT_SQLGLOT (hand list) union index/import_sqlglot.json
@@ -47,7 +52,7 @@ import json
 import os
 from pathlib import Path
 
-from blast import prover, safe
+from blast import attrs, prover, safe
 from blast.fixtures import TestIndex
 from blast.imports import ImportGraph
 from blast.locate import Loc, Locator, module_of, names_bound
@@ -79,6 +84,12 @@ UNUSED_FILES = os.environ.get("UNUSED_FILES", "1") == "1"
 # NOCU_NAMES=1: a class body change whose class has no class_users entry (never instantiated, nor
 # a subclass) follows the class name through rule b's name chain instead of FULL.
 NOCU_NAMES = os.environ.get("NOCU_NAMES", "0") == "1"
+# ATTR_LEVEL=1 (map v4): a class-body edit selects the tests that read the attribute(s) it changes
+# (attr_users) or, for dict entries, that looked up the changed keys or iterated the dict
+# (key_users[key] | key_users["*"]), for the class and every subclass key in the map (rule b').
+# Anything read at import time (attr_import / key_import), ambiguous, or unknown to the map ->
+# class_users as before.
+ATTR_LEVEL = os.environ.get("ATTR_LEVEL", "0") == "1"
 # MODULE_NAMES=1: a module-level name bound in file D is looked up only where it can mean D's
 # binding: in D itself, as an attribute (x.NAME), or in a file that imports NAME (or *) from D.
 # Re-exports chain through rule b (the importing line binds NAME in the importer).
@@ -339,6 +350,62 @@ class _File:
         self.import_time = False  # rule g: this file's own import-time code changed
         self.verdict: prover.FileVerdict | None = None
         self._scopes_same: bool | None = None
+        self._attr_cache: dict[tuple[str, ...], frozenset[int] | None] = {}
+
+    # -- rule b': ATTR_LEVEL ------------------------------------------------------------------
+    def attr_level(self, classes: list[str]) -> frozenset[int] | None:
+        """Tests for a class-body edit of the innermost class `classes`; None = use class_users."""
+        key = tuple(classes)
+        if key not in self._attr_cache:
+            try:
+                self._attr_cache[key] = self._attr_level(classes)
+            except (SyntaxError, ValueError, RecursionError):
+                self._attr_cache[key] = None
+        t = self._attr_cache[key]
+        self.note(f"A:{'.'.join(classes)} " + ("fallback" if t is None else f"+{len(t)}"))
+        return t
+
+    def _attr_level(self, classes: list[str]) -> frozenset[int] | None:
+        ctx, db, v = self.ctx, self.ctx.db, self.verdict
+        if not db.has_attr_maps or v is None or v.kind != prover.CHANGED or not v.new_text:
+            return None
+        old_tree = ctx.locator(self.path).tree
+        new_tree = Locator(v.new_text, self.path).tree
+        oc, nc = attrs.class_node(old_tree, classes), attrs.class_node(new_tree, classes)
+        if oc is None or nc is None:
+            return None
+        diff = attrs.class_diff(oc, nc, attrs.aliases(old_tree), attrs.aliases(new_tree))
+        if diff is None:
+            return None
+        cls_key = f"{module_of(self.path)}:{'.'.join(classes)}"
+        subs = ctx.imports().subclasses(cls_key)
+        if subs is None:
+            return None
+        owners = [cls_key, *subs]
+        out: set[int] = set()
+        for name in sorted(diff.whole):
+            bases = [f"{c}.{name}" for c in owners]
+            if any(b in db.attr_import for b in bases) or any(
+                    k.startswith(tuple(f"{b}[" for b in bases)) for k in db.key_import):
+                return None
+            found = [db.attr_users[b] for b in bases if b in db.attr_users]
+            if not found:
+                return None
+            for i in found:
+                out |= db.tests_of_set(i)
+        for name, spellings in sorted(diff.keys.items()):
+            bases = [f"{c}.{name}" for c in owners]
+            if any(b in db.attr_import for b in bases):
+                return None
+            look = [f"{b}[{k}]" for b in bases for k in sorted(spellings | {"*"})]
+            if any(k in db.key_import for k in look):
+                return None
+            found = [db.key_users[k] for k in look if k in db.key_users]
+            if not found:
+                return None
+            for i in found:
+                out |= db.tests_of_set(i)
+        return frozenset(out) or None
 
     def scopes_same(self) -> bool:
         """FUNC_LEVEL=2 guard: old and new text have the same scope signature."""
@@ -388,6 +455,11 @@ class _File:
         elif loc.classes:
             if safe.on("B"):
                 raise Full(f"SAFE B: {path}:{loc.line} class body {'.'.join(loc.classes)}")
+            if ATTR_LEVEL and path == self.path:
+                t = self.attr_level(loc.classes)
+                if t is not None:
+                    self.add(t, f"A:{'.'.join(loc.classes)}")
+                    return
             for key in loc.class_keys(module_of(path)):
                 t = ctx.db.class_user_tests(key)
                 if t is None and NOCU_NAMES and loc.top is not None and names_bound(loc.top):

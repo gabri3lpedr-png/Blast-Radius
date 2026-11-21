@@ -93,6 +93,26 @@ TEST_FIX = textwrap.dedent('''\
             pass
     ''')
 
+# ATTR_LEVEL fixture: class attributes and dict entries
+KINDS = textwrap.dedent('''\
+    class Base:
+        NAME = "base"
+        TABLE = {
+            "a": 1,
+            "b": 2,
+        }
+
+
+    class Sub(Base):
+        OTHER = 1
+
+
+    class Dep:
+        T = {"x": 1}
+        U = {**T}
+    ''')
+# line: 1 Base | 2 NAME | 3-6 TABLE | 9 Sub | 10 OTHER | 13 Dep | 14 T | 15 U
+
 IDS = [
     "tests/test_mod.py::TestMod::test_a",     # 0
     "tests/test_mod.py::TestMod::test_b",     # 1
@@ -143,6 +163,7 @@ class RulesTest(unittest.TestCase):
             "sqlglot/eager.py": EAGER,
             "sqlglot/mod.py": MOD,
             "sqlglot/user.py": USER,
+            "sqlglot/kinds.py": KINDS,
             "tests/__init__.py": "",
             "tests/test_mod.py": TEST_MOD,
             "tests/test_fix.py": TEST_FIX,
@@ -517,6 +538,107 @@ class SetupStopgapTest(RulesTest):
         self.assertEqual(ctx.group_of_first[AGG], frozenset(EXECUTOR))
 
     # RulesTest's own cases assume the stopgap off; do not rerun them here
+    for _name in [n for n in dir(RulesTest) if n.startswith("test_")]:
+        locals()[_name] = None
+    del _name
+
+
+_K = "sqlglot.kinds:"
+ATTR_MAP = {
+    **FAKE_MAP,
+    "sets": FAKE_MAP["sets"] + [[a, b, fix, other]],  # 6: class_users of every kinds.py class
+    "import_lines": {**FAKE_MAP["import_lines"], "sqlglot/kinds.py": [1, 2, 3, 4, 5, 6, 9, 10, 13, 14, 15]},
+    "class_users": {**FAKE_MAP["class_users"], _K + "Base": 6, _K + "Sub": 6, _K + "Dep": 6},
+    "attr_users": {_K + "Base.NAME": 0, _K + "Sub.NAME": 2, _K + "Dep.U": 3},
+    "key_users": {_K + "Base.TABLE['a']": 0, _K + "Sub.TABLE['a']": 4, _K + "Base.TABLE[*]": 2,
+                  _K + "Base.TABLE['b']": 3, _K + "Dep.T['x']": 0},
+    "attr_import": [],
+    "key_import": [],
+}
+CLASS_USERS = {A, B, FIX, OTHER, FLAKY, C}  # set 6 + rule f (baseline FLAKY, unmapped C in test_mod.py)
+
+
+class AttrLevelTest(RulesTest):
+    """ATTR_LEVEL (rule b') against a hand-made map v4."""
+
+    def setUp(self):
+        self._saved = sel.ATTR_LEVEL
+        sel.ATTR_LEVEL = True
+
+    def tearDown(self):
+        sel.ATTR_LEVEL = self._saved
+
+    def sel_kinds(self, old, new, raw=ATTR_MAP):
+        return self.run_sel({"sqlglot/kinds.py": (old, new)}, raw=raw)
+
+    def test_dict_entry_selects_key_users_of_class_and_subclass_plus_star(self):
+        got, trail = self.sel_kinds('        "a": 1,\n', '        "a": 9,\n')
+        self.assertEqual(got, {A, FIX, B, FLAKY, C}, trail)
+        self.assertIn("A:Base", trail)
+
+    def test_new_key_selects_star(self):
+        got, trail = self.sel_kinds('        "b": 2,\n', '        "b": 2,\n        "z": 5,\n')
+        self.assertEqual(got, {B, FLAKY, C}, trail)
+
+    def test_scalar_attr_selects_attr_users_of_class_and_subclass(self):
+        got, trail = self.sel_kinds('    NAME = "base"\n', '    NAME = "other"\n')
+        self.assertEqual(got, {A, B, FLAKY, C}, trail)
+
+    def test_dependent_attr_changes_as_a_whole(self):
+        got, trail = self.sel_kinds('    T = {"x": 1}\n', '    T = {"x": 2}\n')
+        self.assertEqual(got, {A, OTHER, FLAKY, C}, trail)
+
+    def test_key_read_at_import_falls_back(self):
+        raw = {**ATTR_MAP, "key_import": [_K + "Base.TABLE['a']"]}
+        got, trail = self.sel_kinds('        "a": 1,\n', '        "a": 9,\n', raw)
+        self.assertEqual(got, CLASS_USERS, trail)
+        self.assertIn("fallback", trail)
+
+    def test_attr_read_at_import_in_a_subclass_falls_back(self):
+        raw = {**ATTR_MAP, "attr_import": [_K + "Sub.TABLE"]}
+        got, trail = self.sel_kinds('        "a": 1,\n', '        "a": 9,\n', raw)
+        self.assertEqual(got, CLASS_USERS, trail)
+
+    def test_ambiguous_key_falls_back(self):
+        got, trail = self.sel_kinds('        "b": 2,\n', '        key_var: 2,\n')
+        self.assertEqual(got, CLASS_USERS, trail)
+
+    def test_attr_unknown_to_the_map_falls_back(self):
+        got, trail = self.sel_kinds("    OTHER = 1\n", "    OTHER = 2\n")
+        self.assertEqual(got, CLASS_USERS, trail)
+
+    def test_non_attribute_statement_falls_back(self):
+        got, trail = self.sel_kinds("    U = {**T}\n", "    U = {**T}\n    print(U)\n")
+        self.assertEqual(got, CLASS_USERS, trail)
+
+    def test_old_map_without_attr_keys_is_unchanged(self):
+        raw = {k: v for k, v in ATTR_MAP.items()
+               if k not in ("attr_users", "key_users", "attr_import", "key_import")}
+        got, trail = self.sel_kinds('        "a": 1,\n', '        "a": 9,\n', raw)
+        self.assertEqual(got, CLASS_USERS, trail)
+
+    def test_flag_off_is_unchanged(self):
+        sel.ATTR_LEVEL = False
+        got, trail = self.sel_kinds('        "a": 1,\n', '        "a": 9,\n')
+        self.assertEqual(got, CLASS_USERS, trail)
+
+    def test_key_spellings(self):
+        import ast as _ast
+
+        from blast import attrs
+
+        def sp(src, al=None):
+            return attrs.key_spellings(_ast.parse(src, mode="eval").body, al or {})
+
+        self.assertIn("Alias", sp("exp.Alias"))
+        self.assertIn("DataType.Type.INT", sp("exp.DataType.Type.INT"))
+        self.assertIn("TokenType.SELECT", sp("TT.SELECT", {"TT": "TokenType"}))
+        self.assertEqual(sp("'x'"), {"'x'"})
+        self.assertIsNone(sp("exp.SOME_CONST"))
+        self.assertIsNone(sp("name"))
+        self.assertIsNone(sp("f(1)"))
+
+    # RulesTest's own cases run in RulesTest; do not rerun them here
     for _name in [n for n in dir(RulesTest) if n.startswith("test_")]:
         locals()[_name] = None
     del _name

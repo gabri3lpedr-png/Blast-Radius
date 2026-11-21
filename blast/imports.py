@@ -10,6 +10,8 @@
             (whose __init__ has __getattr__) and the names that load them: module basename and
             top-level class names
   "attr_refs": {name: {path: [lines]}}                      x.NAME attribute uses of those names
+  "classes": {"module:qualname": [base names]}              every class (nested ones too, not in
+            defs) with the last dotted component of each base: subclasses by NAME (over-includes)
 }
 
 Resolution is conservative (over-includes): `import a.b.c` imports a, a.b and a.b.c; `from P import
@@ -144,6 +146,7 @@ def build(src: Path) -> dict:
 
     edges: list[list] = []
     dynamic: list[list] = []
+    classes: dict[str, list[str]] = {}
     for mod, rel in sorted(mods.items(), key=lambda kv: kv[1]):
         try:
             tree = ast.parse((src / rel).read_bytes(), filename=rel)
@@ -188,11 +191,28 @@ def build(src: Path) -> dict:
             visit(child, fn)
 
         visit(tree, None)
+
+        def classes_in(body, prefix: str) -> None:
+            for n in body:
+                if isinstance(n, ast.ClassDef):
+                    q = f"{prefix}{n.name}"
+                    bases = []
+                    for b in n.bases:
+                        while isinstance(b, ast.Subscript):  # Generic[T]
+                            b = b.value
+                        bases.append(b.attr if isinstance(b, ast.Attribute) else getattr(b, "id", "?"))
+                    classes[f"{mod}:{q}"] = bases
+                    classes_in(n.body, q + ".")
+                elif isinstance(n, (ast.If, ast.Try)):
+                    classes_in(n.body + n.orelse + getattr(n, "finalbody", []), prefix)
+
+        classes_in(tree.body, "")
         for node in ast.walk(tree):
             if isinstance(node, ast.Attribute) and node.attr in wanted:
                 attr_refs[node.attr][rel].add(node.end_lineno)
     return {"edges": edges, "dynamic": sorted({tuple(d) for d in dynamic}), "lazy": lazy_names,
-            "attr_refs": {n: {p: sorted(ls) for p, ls in v.items()} for n, v in attr_refs.items()}}
+            "attr_refs": {n: {p: sorted(ls) for p, ls in v.items()} for n, v in attr_refs.items()},
+            "classes": classes}
 
 
 def _type_checking(test: ast.AST) -> bool:
@@ -216,6 +236,31 @@ class ImportGraph:
         self.lazy_names: dict[str, list[str]] = {
             sub: names for subs in raw["lazy"].values() for sub, names in subs.items()}
         self.attr_refs: dict[str, dict[str, list[int]]] = raw["attr_refs"]
+        self.classes: dict[str, list[str]] | None = raw.get("classes")
+        self._by_base: dict[str, list[str]] | None = None
+
+    def subclasses(self, key: str) -> list[str] | None:
+        """Class keys that may subclass `key` ("module:qualname"), by base NAME, transitively
+        (same-named classes elsewhere come along: over-includes). None: no class index."""
+        if self.classes is None:
+            return None
+        if self._by_base is None:
+            self._by_base = defaultdict(list)
+            for k, bases in self.classes.items():
+                for b in bases:
+                    self._by_base[b].append(k)
+        out: set[str] = set()
+        todo = [key.rsplit(".", 1)[-1].rsplit(":", 1)[-1]]
+        names = set(todo)
+        while todo:
+            for k in self._by_base.get(todo.pop(), ()):
+                if k not in out and k != key:
+                    out.add(k)
+                    n = k.rsplit(":", 1)[-1].rsplit(".", 1)[-1]
+                    if n not in names:
+                        names.add(n)
+                        todo.append(n)
+        return sorted(out)
 
     def never_imported(self, path: str) -> bool:
         """No static import of it, no lazy attribute that loads it, not a package, not a file

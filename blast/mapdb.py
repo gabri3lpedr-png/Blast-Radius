@@ -31,6 +31,13 @@ class MapDB:
         self._import: dict[str, frozenset[int]] = {}
         self.files_read: dict[str, int] = raw.get("files_read") or {}
         self.class_users: dict[str, int] = raw.get("class_users") or {}
+        # map v4 (ATTR_LEVEL): "module:qualname.ATTR" / "module:qualname.ATTR[key]" -> set index,
+        # and the same keys read / iterated at import time. Absent in older maps.
+        self.has_attr_maps = "attr_users" in raw or "key_users" in raw
+        self.attr_users: dict[str, int] = raw.get("attr_users") or {}
+        self.key_users: dict[str, int] = raw.get("key_users") or {}
+        self.attr_import: frozenset[str] = frozenset(raw.get("attr_import") or [])
+        self.key_import: frozenset[str] = frozenset(raw.get("key_import") or [])
         mapped = {n for n in self._num if n is not None}
         self.unmapped: frozenset[int] = frozenset(set(number_by_id.values()) - mapped)
         base: set[int] = set()
