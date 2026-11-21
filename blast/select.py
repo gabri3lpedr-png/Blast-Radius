@@ -13,6 +13,10 @@ Rules (docs/GUIDE_B_Selector.md, Stage B3):
     all tests in the file + tests covering the helper.
  e) DATA files: files_read; nothing -> fixture name fallback (blast/fixtures.py); else FULL.
  f) Always add failed_at_baseline, and UNMAPPED tests living in a file we selected from.
+ g) Tests that run `import sqlglot` in a SUBPROCESS (the map cannot see them, e.g. test_lazy_load):
+    added when a commit changes import-time code (module level, class body, def header) of a
+    module that `import sqlglot` loads: IMPORT_SQLGLOT (hand list) union index/import_sqlglot.json
+    (recorded at docker build time). Tests are looked up by id in tests.json.
 A CHANGED file for which every lookup finds nothing -> FULL (never guess empty on code).
 
 '+' lines are also located in the NEW text: one that lands outside a def body (new module
@@ -37,6 +41,19 @@ FUNC_LEVEL = os.environ.get("FUNC_LEVEL", "1") != "0"
 MAX_DEPTH = 3
 MAX_REF_FILES = 15  # a name used more widely than this -> FULL (cheaper than parsing it all)
 MAX_REF_LINES = 300
+
+# Rule g. Tests that run `import sqlglot` in a subprocess (ids, never numbers).
+SUBPROCESS_IMPORT_TESTS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
+# Modules `import sqlglot` loads (Person A's list); a trailing "/" is a whole package.
+IMPORT_SQLGLOT = frozenset({
+    "sqlglot/__init__.py", "sqlglot/_typing.py", "sqlglot/dialects/__init__.py",
+    "sqlglot/dialects/dialect.py", "sqlglot/expressions/", "sqlglot/parser.py",
+    "sqlglot/generator.py", "sqlglot/tokens.py", "sqlglot/tokenizer_core.py", "sqlglot/schema.py",
+    "sqlglot/optimizer/__init__.py", "sqlglot/optimizer/scope.py", "sqlglot/helper.py",
+    "sqlglot/time.py", "sqlglot/trie.py", "sqlglot/jsonpath.py", "sqlglot/diff.py",
+    "sqlglot/errors.py", "sqlglot/parsers/__init__.py", "sqlglot/parsers/base.py",
+    "sqlglot/typing/__init__.py",
+})
 
 
 class Full(Exception):
@@ -66,6 +83,15 @@ class Ctx:
             self.tests_by_file.setdefault(t["file"], set()).add(t["number"])
         self.tests_by_file = {k: frozenset(v) for k, v in self.tests_by_file.items()}
         self._loc: dict[str, Locator] = {}
+        self.import_sqlglot = _import_sqlglot(index_dir / "import_sqlglot.json")
+        self.subprocess_import_tests = frozenset(
+            self.number_by_id[i] for i in SUBPROCESS_IMPORT_TESTS if i in self.number_by_id
+        )
+
+    def loaded_by_import_sqlglot(self, path: str) -> bool:
+        return path in self.import_sqlglot or any(
+            p.endswith("/") and path.startswith(p) for p in self.import_sqlglot
+        )
 
     def locator(self, path: str) -> Locator:
         loc = self._loc.get(path)
@@ -86,6 +112,17 @@ class Ctx:
             except OSError as e:
                 raise Full(f"no name index ({type(e).__name__})") from e
         return self._names.get(name) or {}
+
+
+def _import_sqlglot(path: Path) -> frozenset[str]:
+    """IMPORT_SQLGLOT union what the build recorded. Missing/broken record -> Full on use."""
+    try:
+        recorded = json.loads(path.read_text("utf-8"))
+        if not isinstance(recorded, list) or "sqlglot/__init__.py" not in recorded:
+            raise ValueError("bad record")
+    except (OSError, ValueError) as e:
+        return frozenset({"<unknown>", *IMPORT_SQLGLOT, f"<error {type(e).__name__}>"})
+    return IMPORT_SQLGLOT | frozenset(recorded)
 
 
 def _added_new_lines(fp) -> list[int]:
@@ -112,6 +149,7 @@ class _File:
         self.out: set[int] = set()
         self.notes: list[str] = []
         self._seen_names: set[str] = set()
+        self.import_time = False  # rule g: this file's own import-time code changed
 
     def note(self, s: str) -> None:
         if len(self.notes) < 12:
@@ -187,6 +225,7 @@ class _File:
             if not hit:
                 self.note(f"DEAD L{loc.line}")
             return
+        self.import_time = True  # module level, class body or def header
         if loc.kind == "def_header":
             self.add(ctx.db.line_tests(path, _def_lines(loc.func)), f"b:def {loc.func.name}")
         self.import_effect(path, loc, 0)
@@ -243,6 +282,7 @@ class _File:
                 loc = new.locate(line)
                 if loc.kind == "def_body":
                     continue  # runtime code: covered by the original neighbour lines
+                self.import_time = True
                 if is_test:
                     self.test_line(loc)
                 else:
@@ -260,6 +300,12 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
         if v.kind == prover.CHANGED:
             f = _File(ctx, v.path)
             out |= f.run(v)
+            if f.import_time and v.path.startswith("sqlglot/"):
+                if "<unknown>" in ctx.import_sqlglot:
+                    raise Full("no record of the modules `import sqlglot` loads")
+                if ctx.loaded_by_import_sqlglot(v.path) and ctx.subprocess_import_tests - out:
+                    out |= ctx.subprocess_import_tests
+                    f.note(f"g:import sqlglot+{len(ctx.subprocess_import_tests)}")
             trail.append(f"{v.path}: {' '.join(f.notes)}")
         elif v.kind == prover.DATA:
             t, rule = ctx.db.file_read_tests(v.path), "e:files_read"

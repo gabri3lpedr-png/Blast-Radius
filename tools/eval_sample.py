@@ -48,7 +48,7 @@ def index_dir(src: Path) -> Path:
     if "INDEX_DIR" in os.environ:
         return Path(os.environ["INDEX_DIR"])
     out = CACHE / "index"
-    if not (out / "test_strings.json.gz").exists():
+    if not all((out / f).exists() for f in ("test_strings.json.gz", "import_sqlglot.json")):
         subprocess.run([sys.executable, str(ROOT / "blast" / "build_index.py"), str(src), str(out)], check=True)
     return out
 

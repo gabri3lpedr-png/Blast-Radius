@@ -6,6 +6,7 @@ Run: python3 -m unittest discover -s blast/tests -t .     (or: make unit)
 from __future__ import annotations
 
 import difflib
+import json
 import tempfile
 import textwrap
 import unittest
@@ -66,6 +67,16 @@ TEST_MOD = textwrap.dedent('''\
     ''')
 # line: 2 import helper | 7 self.v | 10 test_a body | 13 test_b body | 16 test_c body
 
+# Imported by sqlglot/__init__.py, so `import sqlglot` loads it (rule g); mod.py is not.
+EAGER = textwrap.dedent('''\
+    FLAG = 1
+
+
+    def use_flag():
+        return FLAG
+    ''')
+# line: 1 FLAG | 4 def use_flag | 5 return FLAG
+
 TEST_FIX = textwrap.dedent('''\
     import unittest
     from tests.helpers import load_sql_fixture_pairs
@@ -87,8 +98,9 @@ IDS = [
     "tests/test_fix.py::TestFix::test_other", # 3
     "tests/test_mod.py::TestMod::test_c",     # 4  UNMAPPED (not in the map)
     "tests/test_base.py::TestB::test_flaky",  # 5  failed_at_baseline
+    "tests/dialects/test_dialect.py::TestDialect::test_lazy_load",  # 6 UNMAPPED, rule g
 ]
-A, B, FIX, OTHER, C, FLAKY = range(6)
+A, B, FIX, OTHER, C, FLAKY, LAZY = range(7)
 
 # The fake map. Map test index != tests.json number on purpose (order differs).
 MAP_TESTS = [IDS[FLAKY], IDS[A], IDS[B], IDS[FIX], IDS[OTHER], "tests/gone.py::T::test_gone"]
@@ -101,9 +113,10 @@ FAKE_MAP = {
     "lines": {
         "sqlglot/mod.py": {"5": 0, "6": 1, "17": 2},
         "sqlglot/user.py": {"5": 2},
+        "sqlglot/eager.py": {"5": 0},
         "tests/test_mod.py": {"7": 1, "10": 0, "13": 2},
     },
-    "import_lines": {"sqlglot/mod.py": [1, 4, 9, 13, 14, 16], "sqlglot/user.py": [1, 4]},
+    "import_lines": {"sqlglot/mod.py": [1, 4, 9, 13, 14, 16], "sqlglot/user.py": [1, 4], "sqlglot/eager.py": [1, 4]},
     "files_read": {"tests/fixtures/optimizer/bar.sql": 2},
     "class_users": {"sqlglot.mod:Thing": 3},
     "failed_at_baseline": [IDS[FLAKY]],
@@ -124,7 +137,8 @@ class RulesTest(unittest.TestCase):
         root = Path(cls._tmp.name)
         cls.src = root / "src"
         files = {
-            "sqlglot/__init__.py": "",
+            "sqlglot/__init__.py": "from sqlglot import eager\n",
+            "sqlglot/eager.py": EAGER,
             "sqlglot/mod.py": MOD,
             "sqlglot/user.py": USER,
             "tests/__init__.py": "",
@@ -138,6 +152,8 @@ class RulesTest(unittest.TestCase):
         cls.index.mkdir()
         build_index._write(cls.index / "name_index.json.gz", build_index.build(cls.src))
         build_index._write(cls.index / "test_strings.json.gz", TestIndex(cls.src)._build())
+        cls.import_mods = build_index.import_sqlglot_modules(cls.src)
+        (cls.index / "import_sqlglot.json").write_text(json.dumps(cls.import_mods), "utf-8")
         files_of = {IDS[i]: IDS[i].split("::")[0] for i in range(len(IDS))}
         cls.tests = [{"number": i, "id": tid, "file": files_of[tid], "seconds": 1.0} for i, tid in enumerate(IDS)]
         cls.number_by_id = {t["id"]: t["number"] for t in cls.tests}
@@ -171,7 +187,7 @@ class RulesTest(unittest.TestCase):
     def test_mapdb_ids_to_numbers(self):
         db = MapDB(FAKE_MAP, self.number_by_id)
         self.assertEqual(db.tests_of_set(5), {A, B})  # map index 5 is unknown to tests.json
-        self.assertEqual(db.unmapped, {C})
+        self.assertEqual(db.unmapped, {C, LAZY})
         self.assertEqual(db.failed_at_baseline, {FLAKY})
 
     # -- a) statement lines -> map "lines" (+ f: baseline, unmapped in a selected file) ----
@@ -230,6 +246,45 @@ class RulesTest(unittest.TestCase):
         raw = dict(FAKE_MAP, class_users={})
         with self.assertRaises(sel.Full):
             self.run_sel({"sqlglot/mod.py": ('    KIND = "a"\n', '    KIND = "b"\n')}, raw=raw)
+
+    # -- g) `import sqlglot` in a subprocess ----------------------------------------------------
+    def test_g_probe_records_what_import_sqlglot_loads(self):
+        self.assertEqual(self.import_mods, ["sqlglot/__init__.py", "sqlglot/eager.py"])
+
+    def test_g_import_time_change_in_loaded_module_adds_lazy_load(self):
+        trail = self.assertSelects({"sqlglot/eager.py": ("FLAG = 1\n", "FLAG = 2\n")}, {A, C, FLAKY, LAZY})
+        self.assertIn("g:import sqlglot+1", trail)
+
+    def test_g_new_module_statement_in_loaded_module_adds_lazy_load(self):
+        self.assertSelects(
+            {"sqlglot/eager.py": ("FLAG = 1\n", "FLAG = 1\nOTHER_FLAG = FLAG\n")}, {A, C, FLAKY, LAZY}
+        )
+
+    def test_g_def_body_change_does_not(self):
+        self.assertSelects({"sqlglot/eager.py": ("    return FLAG\n", "    return FLAG + 1\n")}, {A, C, FLAKY})
+
+    def test_g_module_not_loaded_by_import_sqlglot_does_not(self):
+        self.assertSelects({"sqlglot/mod.py": ('    KIND = "a"\n', '    KIND = "b"\n')}, {OTHER, FLAKY})
+
+    def test_g_hand_list_is_used_even_if_the_probe_missed_a_module(self):
+        ctx = self.ctx()
+        self.assertFalse(ctx.loaded_by_import_sqlglot("sqlglot/mod.py"))
+        for path in ("sqlglot/parser.py", "sqlglot/expressions/core.py", "sqlglot/eager.py",
+                     "sqlglot/optimizer/scope.py", "sqlglot/_typing.py"):
+            self.assertTrue(ctx.loaded_by_import_sqlglot(path), path)
+        self.assertEqual(ctx.subprocess_import_tests, {LAZY})
+
+    def test_g_missing_probe_record_is_full_for_import_time_changes(self):
+        rec = self.index / "import_sqlglot.json"
+        saved = rec.read_text("utf-8")
+        rec.unlink()
+        try:
+            with self.assertRaises(sel.Full):
+                self.run_sel({"sqlglot/mod.py": ('    KIND = "a"\n', '    KIND = "b"\n')})
+            self.assertSelects({"sqlglot/eager.py": ("    return FLAG\n", "    return FLAG + 1\n")},
+                               {A, C, FLAKY})  # runtime-only changes do not need it
+        finally:
+            rec.write_text(saved, "utf-8")
 
     # -- d) tests/*.py --------------------------------------------------------------------
     def test_d_inside_a_test_selects_that_test(self):
