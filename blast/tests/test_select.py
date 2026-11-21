@@ -642,3 +642,63 @@ class AttrLevelTest(RulesTest):
     for _name in [n for n in dir(RulesTest) if n.startswith("test_")]:
         locals()[_name] = None
     del _name
+
+
+class HeavyHelpersTest(unittest.TestCase):
+    """blast/heavy.py pieces that need no build index."""
+
+    def test_canon_is_order_free_for_identity_hashed_keys_only(self):
+        from blast import heavy
+
+        class K:
+            pass
+
+        a, b = K(), K()
+        self.assertEqual(heavy.canon({a: 1, b: 1}), heavy.canon({b: 1, a: 1}))
+        self.assertNotEqual(heavy.canon({"x": 1, "y": 2}), heavy.canon({"y": 2, "x": 1}))
+        self.assertNotEqual(heavy.canon([1, 2]), heavy.canon([2, 1]))
+        self.assertEqual(heavy.canon((int, str)), heavy.canon((str, int)))
+
+    def test_canon_handles_cycles_and_shared_objects(self):
+        from blast import heavy
+
+        x: list = []
+        x.append(x)
+        self.assertIn("@0", heavy.canon(x))
+
+    def test_outer_def(self):
+        import ast as _ast
+
+        from blast import heavy
+
+        tree = _ast.parse(textwrap.dedent("""\
+            X = 1
+            class C:
+                Y = 2
+                def m(self, z=3):
+                    def inner():
+                        return 4
+                    return inner()
+            """))
+        self.assertIsNone(heavy._outer_def(tree, 1))  # module level
+        self.assertIsNone(heavy._outer_def(tree, 3))  # class body
+        self.assertIsNone(heavy._outer_def(tree, 4))  # def header (defaults run at import)
+        qual, node = heavy._outer_def(tree, 6)
+        self.assertEqual(qual, ("C", "m"))  # outermost def, not inner
+        self.assertIs(heavy._find_def(tree, ("C", "m")), node)
+
+    def test_overlay(self):
+        from blast import heavy
+
+        with tempfile.TemporaryDirectory() as d:
+            src, dst = Path(d) / "src", Path(d) / "dst"
+            (src / "pkg" / "sub").mkdir(parents=True)
+            (src / "pkg" / "a.py").write_text("A")
+            (src / "pkg" / "sub" / "b.py").write_text("B")
+            (src / "top.txt").write_text("T")
+            heavy.overlay(src, dst, {"pkg/a.py": "PATCHED"})
+            self.assertEqual((dst / "pkg" / "a.py").read_text(), "PATCHED")
+            self.assertTrue((dst / "pkg" / "sub").is_symlink())
+            self.assertTrue((dst / "top.txt").is_symlink())
+            self.assertFalse((dst / "pkg").is_symlink())
+            self.assertEqual((src / "pkg" / "a.py").read_text(), "A")

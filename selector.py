@@ -14,16 +14,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from blast import diff, mapdb, prover, safe  # noqa: E402
+from blast import diff, heavy, mapdb, prover, safe  # noqa: E402
 from blast import select as sel  # noqa: E402
 from blast.log import log  # noqa: E402
 from blast.pack import duration_ms, pack  # noqa: E402
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
+# HEAVY_REPLAY=1: drop TestExecutor's TPC tests when blast/heavy.py proves they cannot fail.
+HEAVY_REPLAY = os.environ.get("HEAVY_REPLAY", "0") == "1"
+TMP = Path(os.environ.get("TMPDIR", "/tmp"))
 SRC = Path(os.environ.get("SQLGLOT_SRC", "/opt/sqlglot"))
 
 
-def select(commit: str, patch_text: str, all_tests: list[int], ctx_factory) -> tuple[list[int], str]:
+def select(commit: str, patch_text: str, all_tests: list[int], ctx_factory, replayer=None
+           ) -> tuple[list[int], str]:
     """Return (selected test numbers, reason)."""
     patches = diff.parse(patch_text)
     if not patches:
@@ -41,7 +45,11 @@ def select(commit: str, patch_text: str, all_tests: list[int], ctx_factory) -> t
         return all_tests, f"FULL {e}; {trail}"
     if len(selected) >= len(all_tests):
         return all_tests, f"FULL (selected everything) {rules}; {trail}"
-    return sorted(selected), f"MAP {len(selected)} tests [{rules}]; {trail}"
+    out, note = sorted(selected), ""
+    if replayer is not None:
+        out, note = replayer.maybe_drop(out, verdicts, ctx_factory(), TMP)
+        note = f" {note}" if note else ""
+    return out, f"MAP {len(out)} tests [{rules}]{note}; {trail}"
 
 
 def main() -> None:
@@ -65,13 +73,14 @@ def main() -> None:
         return ctx
     all_tests = sorted(ms)
     full = pack([(n, ms[n]) for n in all_tests])
+    replayer = heavy.Replayer(sel.INDEX_DIR / "heavy.json", SRC, number_by_id, ms) if HEAVY_REPLAY else None
 
     out = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         commit = patch.stem
         try:
             text = patch.read_bytes().decode("utf-8", "replace")
-            selected, reason = select(commit, text, all_tests, ctx_factory)
+            selected, reason = select(commit, text, all_tests, ctx_factory, replayer)
             workers = full if selected is all_tests else pack([(n, ms[n]) for n in selected])
         except Exception as e:  # noqa: BLE001 - never crash the run
             workers, reason = full, f"FULL exception {type(e).__name__}: {e}"
@@ -80,6 +89,11 @@ def main() -> None:
 
     sys.stdout.write("".join(line + "\n" for line in out))
     sys.stdout.flush()
+    import resource
+
+    ru = [resource.getrusage(w) for w in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN)]
+    log(f"cpu {sum(r.ru_utime + r.ru_stime for r in ru):.2f} s (children "
+        f"{ru[1].ru_utime + ru[1].ru_stime:.2f} s), HEAVY_REPLAY={int(HEAVY_REPLAY)}")
 
 
 if __name__ == "__main__":
