@@ -1,6 +1,6 @@
 #!/bin/sh
 # DEV-ONLY: run the image under the scorer's flags on a data dir with HEAVY_REPLAY=$2, score it.
-# Usage: sh tools/heavy_eval.sh <data dir> <0|1> [image]    (prints score.py + the selector cpu line)
+# Usage: sh tools/heavy_eval.sh <data dir> <0|static|1> [image]    (prints score.py + the selector cpu line)
 set -eu
 D=$(cd "$1" && pwd); H=$2; IMG=${3:-blast-radius-entry}
 OUT=$(mktemp); ERR=$(mktemp)

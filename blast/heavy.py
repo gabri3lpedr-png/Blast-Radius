@@ -29,7 +29,8 @@ transpile), then a pool worker's part on those pickles (unpickle, find_tables, e
 optimize, sql, Plan); the module state is dumped in the worker only (the test process's state
 never reaches a spawned worker). opt_tpch's expensive phase runs no sqlglot code: no state.
 
-Runtime (selector, flag HEAVY_REPLAY=1), when a heavy test is selected:
+Runtime (selector, HEAVY_REPLAY=static: the guard and static drops only; =1: also replays), when a
+heavy test is selected:
   guard  every changed file is NOOP, a sqlglot/**.py whose changed lines (old text and '+' lines
          of the new text) all lie in def bodies whose OUTERMOST def has no E_LINES (the expensive
          phase never calls it, so with identical inputs it runs identical code), or a TPC .sql
@@ -52,14 +53,11 @@ if __name__ == "__main__":  # run as a script: blast/ is sys.path[0] and blast/s
     sys.path[0] = str(Path(__file__).resolve().parent.parent)  # shadow the stdlib `select`
 
 import ast
-import enum
-import hashlib
 import json
 import os
-import pickle
-import re
-import subprocess
-import types
+
+# enum, hashlib, pickle, re, subprocess, types: imported inside the functions that need them, so
+# the selector's static checks (HEAVY_REPLAY=static) do not pay for them at startup.
 
 TESTS = {
     "tpcds": "tests/test_executor.py::TestExecutor::test_execute_tpcds",
@@ -76,6 +74,7 @@ REPLAY_TIMEOUT = 60
 
 # -- canonical dump ----------------------------------------------------------------------------
 def _named(x) -> bool:
+    import types
     return isinstance(x, (type, types.FunctionType, types.BuiltinFunctionType))
 
 
@@ -86,6 +85,7 @@ def _name_of(x) -> str:
 def _identity_hashed(k) -> bool:
     """Keys whose hash is their address (classes, functions, plain objects): dict order built
     from them, e.g. by iterating a set, differs from run to run."""
+    import types
     if isinstance(k, (type, types.FunctionType)):
         return True
     return type(k).__hash__ is object.__hash__
@@ -110,6 +110,7 @@ def canon(root, _flat_sets: bool = False) -> str:
     """Deterministic text for an object graph: scalars by repr, enums/classes/functions by name,
     containers in iteration order, objects by type + __dict__/__slots__, shared objects and
     cycles as back references. Sets are ordered by each element's shallow key."""
+    import enum, re, types
     out: list[str] = []
     memo: dict[int, int] = {}
     keep: list = []
@@ -224,6 +225,7 @@ def canon(root, _flat_sets: bool = False) -> str:
 
 
 def _digest(s: str) -> str:
+    import hashlib
     return hashlib.sha256(s.encode("utf-8", "surrogatepass")).hexdigest()
 
 
@@ -254,6 +256,7 @@ ERRORS: dict[str, int] = {}
 
 def cheap_main(kind: str) -> tuple[list[str], list[bytes]]:
     """The test process's part, per query: (canonical record, the pickle the worker receives)."""
+    import pickle
     from sqlglot import parse_one, transpile
     from tests.helpers import load_sql_fixture_pairs
 
@@ -280,6 +283,7 @@ def cheap_main(kind: str) -> tuple[list[str], list[bytes]]:
 
 def cheap_worker(kind: str, blobs: list[bytes]) -> list[str]:
     """A pool worker's part before the expensive phase, per query (fresh process, like spawn)."""
+    import pickle
     if kind == "opt_tpch":
         return ["" for _ in blobs]
     from sqlglot import find_tables
@@ -337,6 +341,7 @@ def _big_stack(fn):
 
 
 def replay_main(kinds: list[str], blob_path: str) -> dict:
+    import pickle
     sys.setrecursionlimit(1_000_000)
 
     def run():
@@ -352,6 +357,7 @@ def replay_main(kinds: list[str], blob_path: str) -> dict:
 
 
 def replay_worker(kinds: list[str], blob_path: str, modules: dict[str, list[str]]) -> dict:
+    import pickle
     sys.setrecursionlimit(1_000_000)
 
     def run():
@@ -401,6 +407,7 @@ def _execute_lines(src: Path) -> list[int]:
 
 
 def build_lines(src: Path, jobs: int = 4) -> dict[str, dict[str, list[int]]]:
+    import pickle
     import multiprocessing as mp
 
     os.environ["SKIP_INTEGRATION"] = "0"
@@ -519,6 +526,7 @@ print(json.dumps(sorted(hits)))
 
 def cheap_lines(src: Path) -> dict[str, dict[str, list[int]]]:
     """Per test: the lines the cheap phase runs (imports included), in a fresh interpreter."""
+    import subprocess
     root = str(src.resolve()) + "/"
     app = str(Path(__file__).resolve().parent.parent)
     out = {}
@@ -536,6 +544,7 @@ def cheap_lines(src: Path) -> dict[str, dict[str, list[int]]]:
 
 def _worker_start_lines(src: Path, root: str, cls, load_pairs, parse_one) -> set:
     """Lines a fresh spawned worker runs before any task: imports, unpickling initargs/tasks."""
+    import pickle, subprocess
     import tempfile
 
     from tests.helpers import TPCDS_SCHEMA, TPCH_SCHEMA
@@ -585,6 +594,7 @@ def run_replay(src_root: str, kinds: list[str], modules: dict[str, list[str]], t
 def _run_replay(src_root: str, kinds: list[str], modules: dict[str, list[str]], timeout: float) -> dict:
     """The cheap phase on `src_root` (sqlglot + tests) in two fresh interpreters: the test process's
     part, then a pool worker's part on the pickles it produced."""
+    import subprocess
     import tempfile
     import time
 
@@ -702,20 +712,32 @@ class Replayer:
     """HEAVY_REPLAY at runtime. index: <index>/heavy.json from the build."""
 
     def __init__(self, index_path: Path, src: Path, number_by_id: dict[str, int], ms: dict[int, int],
-                 budget_s: float = 90.0):
+                 budget_s: float = 90.0, replay: bool = True):
         self.src, self.ms = src, ms
+        self.replay = replay  # False (HEAVY_REPLAY=static): only drops that need no replay
         self.budget = budget_s
-        try:
-            self.idx = json.loads(index_path.read_text("utf-8"))
-        except (OSError, ValueError):
-            self.idx = None
-        self.numbers = {}
-        if self.idx is not None:
-            self.numbers = {k: number_by_id[i] for k, i in self.idx["tests"].items() if i in number_by_id}
-        self.lines = {k: {p: frozenset(v) for p, v in d.items()} for k, d in (self.idx or {}).get("lines", {}).items()}
-        self.cheap_lines = {k: {p: frozenset(v) for p, v in d.items()}
-                            for k, d in (self.idx or {}).get("cheap_lines", {}).items()}
+        self.index_path = index_path
+        self.numbers = {k: number_by_id[i] for k, i in TESTS.items() if i in number_by_id}
+        self.idx = None  # loaded on the first commit that selects a heavy test
+        self._loaded = False
+        self.lines: dict = {}
+        self.cheap_lines: dict = {}
         self.cpu_est = {"tpcds": 9.5, "tpch": 0.6, "opt_tpch": 0.6}
+
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
+        try:
+            idx = json.loads(self.index_path.read_text("utf-8"))
+        except (OSError, ValueError):
+            return
+        if idx.get("tests") != TESTS:
+            return  # built for other tests: unusable
+        self.idx = idx
+        self.lines = {k: {p: frozenset(v) for p, v in d.items()} for k, d in idx.get("lines", {}).items()}
+        self.cheap_lines = {k: {p: frozenset(v) for p, v in d.items()}
+                            for k, d in idx.get("cheap_lines", {}).items()}
 
     def _executed_query_changed(self, v) -> bool:
         """Cost only (keeping is always safe): did an `# execute: true` query's text change? Its
@@ -804,9 +826,12 @@ class Replayer:
         from blast.apply import apply
         from blast.pack import cost, pack
 
+        sel = set(selected)
+        if not any(n in sel for n in self.numbers.values()):
+            return selected, ""
+        self._load()
         if self.idx is None:
             return selected, "h:no index"
-        sel = set(selected)
         present = [k for k, n in self.numbers.items() if n in sel and k not in self.idx["unstable"]]
         if not present:
             return selected, ""
@@ -819,6 +844,8 @@ class Replayer:
             elif not needs:
                 notes.append(f"h:{k} DROP static")
                 static_drop.add(self.numbers[k])
+            elif not self.replay:
+                notes.append(f"h:{k} keep (needs a replay; HEAVY_REPLAY=static)")
             else:
                 candidates.append(k)
         selected = [n for n in selected if n not in static_drop]

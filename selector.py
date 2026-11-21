@@ -20,8 +20,13 @@ from blast.log import log  # noqa: E402
 from blast.pack import duration_ms, pack  # noqa: E402
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
-# HEAVY_REPLAY=1: drop TestExecutor's TPC tests when blast/heavy.py proves they cannot fail.
-HEAVY_REPLAY = os.environ.get("HEAVY_REPLAY", "1") == "1"
+# HEAVY_REPLAY (blast/heavy.py): drop TestExecutor's TPC tests when they provably cannot fail.
+#   static (default)  only the drops that need no replay: no subprocess, no cheap-phase run
+#   1                 also replay the cheap phase on a /tmp overlay (costs CPU per replay)
+#   0                 off
+HEAVY_REPLAY = os.environ.get("HEAVY_REPLAY", "static").strip().lower()
+if HEAVY_REPLAY not in ("0", "static", "1"):
+    HEAVY_REPLAY = "static"
 TMP = Path(os.environ.get("TMPDIR", "/tmp"))
 SRC = Path(os.environ.get("SQLGLOT_SRC", "/opt/sqlglot"))
 
@@ -73,7 +78,8 @@ def main() -> None:
         return ctx
     all_tests = sorted(ms)
     full = pack([(n, ms[n]) for n in all_tests])
-    replayer = heavy.Replayer(sel.INDEX_DIR / "heavy.json", SRC, number_by_id, ms) if HEAVY_REPLAY else None
+    replayer = (heavy.Replayer(sel.INDEX_DIR / "heavy.json", SRC, number_by_id, ms, replay=HEAVY_REPLAY == "1")
+                if HEAVY_REPLAY != "0" else None)
 
     out = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
@@ -93,7 +99,7 @@ def main() -> None:
 
     ru = [resource.getrusage(w) for w in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN)]
     log(f"cpu {sum(r.ru_utime + r.ru_stime for r in ru):.2f} s (children "
-        f"{ru[1].ru_utime + ru[1].ru_stime:.2f} s), HEAVY_REPLAY={int(HEAVY_REPLAY)}")
+        f"{ru[1].ru_utime + ru[1].ru_stime:.2f} s), HEAVY_REPLAY={HEAVY_REPLAY}")
 
 
 if __name__ == "__main__":
