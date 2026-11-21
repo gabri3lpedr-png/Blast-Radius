@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from blast import diff, heavy, mapdb, prover, safe  # noqa: E402
 from blast import select as sel  # noqa: E402
 from blast.log import log  # noqa: E402
-from blast.pack import duration_ms, pack  # noqa: E402
+from blast.pack import cost, duration_ms, pack  # noqa: E402
 
 DATA = Path(os.environ.get("DATA_DIR", "/data"))
 # HEAVY_REPLAY (blast/heavy.py): drop TestExecutor's TPC tests when they provably cannot fail.
@@ -29,11 +29,28 @@ if HEAVY_REPLAY not in ("0", "static", "1"):
     HEAVY_REPLAY = "static"
 TMP = Path(os.environ.get("TMPDIR", "/tmp"))
 SRC = Path(os.environ.get("SQLGLOT_SRC", "/opt/sqlglot"))
+# RUN_SMALL (blast/runsmall.py): run a tiny selection (recorded seconds <= RUN_SMALL_T, modelled
+# CPU = STARTUP + RATIO x recorded below its cost) and output only the tests that failed.
+RUN_SMALL = os.environ.get("RUN_SMALL", "0").strip() == "1"
+RUN_SMALL_T = float(os.environ.get("RUN_SMALL_T", "1.0"))
+RUN_SMALL_STARTUP = float(os.environ.get("RUN_SMALL_STARTUP", "0.5"))
+RUN_SMALL_RATIO = float(os.environ.get("RUN_SMALL_RATIO", "1.0"))
+RUN_SMALL_BUDGET = float(os.environ.get("RUN_SMALL_BUDGET", "60"))  # wall s for all runs
 
 
-def select(commit: str, patch_text: str, all_tests: list[int], ctx_factory, replayer=None
-           ) -> tuple[list[int], str]:
+def select(commit: str, patch_text: str, all_tests: list[int], ctx_factory, replayer=None,
+           runner=None, ms=None) -> tuple[list[int], str]:
     """Return (selected test numbers, reason)."""
+    out, reason = _select(commit, patch_text, all_tests, ctx_factory, replayer)
+    if runner is not None and out and out is not all_tests:
+        ran, note = runner.maybe_run(out, diff.parse(patch_text), cost(pack([(n, ms[n]) for n in out]), ms))
+        if note:
+            return ran, f"{reason} {note}"
+    return out, reason
+
+
+def _select(commit: str, patch_text: str, all_tests: list[int], ctx_factory, replayer=None
+            ) -> tuple[list[int], str]:
     patches = diff.parse(patch_text)
     if not patches:
         return all_tests, f"FULL parse failed: {getattr(patches, 'reason', '')}"
@@ -80,13 +97,19 @@ def main() -> None:
     full = pack([(n, ms[n]) for n in all_tests])
     replayer = (heavy.Replayer(sel.INDEX_DIR / "heavy.json", SRC, number_by_id, ms, replay=HEAVY_REPLAY == "1")
                 if HEAVY_REPLAY != "0" else None)
+    runner = None
+    if RUN_SMALL:
+        from blast.runsmall import Runner
+
+        runner = Runner(SRC, TMP, tests, RUN_SMALL_T, RUN_SMALL_STARTUP, RUN_SMALL_RATIO,
+                        RUN_SMALL_BUDGET)
 
     out = []
     for patch in sorted((DATA / "commits").glob("*.patch")):
         commit = patch.stem
         try:
             text = patch.read_bytes().decode("utf-8", "replace")
-            selected, reason = select(commit, text, all_tests, ctx_factory, replayer)
+            selected, reason = select(commit, text, all_tests, ctx_factory, replayer, runner, ms)
             workers = full if selected is all_tests else pack([(n, ms[n]) for n in selected])
         except Exception as e:  # noqa: BLE001 - never crash the run
             workers, reason = full, f"FULL exception {type(e).__name__}: {e}"
@@ -99,7 +122,8 @@ def main() -> None:
 
     ru = [resource.getrusage(w) for w in (resource.RUSAGE_SELF, resource.RUSAGE_CHILDREN)]
     log(f"cpu {sum(r.ru_utime + r.ru_stime for r in ru):.2f} s (children "
-        f"{ru[1].ru_utime + ru[1].ru_stime:.2f} s), HEAVY_REPLAY={HEAVY_REPLAY}")
+        f"{ru[1].ru_utime + ru[1].ru_stime:.2f} s), HEAVY_REPLAY={HEAVY_REPLAY}, RUN_SMALL={int(RUN_SMALL)} "
+        f"(T={RUN_SMALL_T}, {runner.runs if runner else 0} runs)")
 
 
 if __name__ == "__main__":
