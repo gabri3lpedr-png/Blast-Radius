@@ -1,14 +1,28 @@
 """pytest plugin for label.py (DEV-ONLY): records which tests failed.
 
-Writes $LABEL_OUT as {"failed": [...], "ok": [...], "exitstatus": n} from the
-xdist controller (or the only process without xdist). label.py counts a test
-as failing when it failed (any phase, any subtest) or never reported ok: that
-covers SUBFAILED, errors, timeouts, crashed workers and unimportable files.
+EVERY pytest process writes its own file, $LABEL_OUT.<worker>.json (worker =
+"main" without xdist or for the xdist controller, else gw0, gw1, ...).
+label.py merges them. Recording in the workers matters: with pytest-xdist,
+subtest failures (SUBFAILED) are not passed on to the controller's hooks, so a
+controller-only recorder labels a broken mutant as harmless.
+
+A test counts as failing when any report for it failed (setup, call, teardown,
+any subtest), or when it never reported ok (errors, timeouts, crashed workers,
+unimportable files).
 """
 import json
 import os
 
 _failed, _ok = set(), set()
+
+
+def _worker(config):
+    return getattr(config, "workerinput", {}).get("workerid", "main")
+
+
+def pytest_configure(config):
+    global _name
+    _name = _worker(config)
 
 
 def pytest_runtest_logreport(report):
@@ -19,7 +33,5 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_sessionfinish(session, exitstatus):
-    if hasattr(session.config, "workerinput"):
-        return
-    with open(os.environ["LABEL_OUT"], "w") as f:
+    with open(f"{os.environ['LABEL_OUT']}.{_name}.json", "w") as f:
         json.dump({"failed": sorted(_failed), "ok": sorted(_ok), "exitstatus": int(exitstatus)}, f)

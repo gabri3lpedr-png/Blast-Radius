@@ -17,6 +17,7 @@ so `make sample SAMPLE=$(pwd)/mutants_out` grades the selector on it.
 Resumable: re-run it and it skips patches already in answers.json.
 """
 import argparse
+import glob
 import json
 import os
 import shutil
@@ -44,28 +45,66 @@ def write_json(path, obj):
     os.replace(tmp, path)
 
 
-def run_suite(mid, jobs):
-    """Run the full suite on WORK. -> (failed ids, ok ids, status)."""
-    out = os.path.join(RAW, f"{mid}.json")
-    if os.path.exists(out):
-        os.remove(out)
+EXECUTOR = "tests/test_executor.py"  # 112 of 251 s, and runs its own 8-process pool
+CONFIRM_MAX = 80                     # re-check at most this many failing tests serially
+
+
+def pytest_run(tag, args, timeout):
+    """One docker run of pytest on WORK. -> (failed, ok) or None on timeout/no result."""
+    for old in glob.glob(os.path.join(RAW, f"{tag}.*.json")):
+        os.remove(old)
     subprocess.run(["docker", "rm", "-f", CONTAINER], capture_output=True)
     cmd = ["docker", "run", "--rm", "--name", CONTAINER, "--platform", "linux/amd64",
            "--volume", f"{WORK}:/opt/sqlglot",
            "--volume", f"{os.path.join(REPO, 'tools', 'mutants')}:/mutants:ro",
            "--volume", f"{RAW}:/out",
-           "--env", "PYTHONPATH=/opt/sqlglot:/mutants", "--env", f"LABEL_OUT=/out/{mid}.json",
-           IMAGE, "python", "-m", "pytest", "tests", "-p", "label_plugin", "-p", "no:cacheprovider",
-           "-q", "-n", str(jobs), "--dist", "load", "--timeout", "300"]
+           "--env", "PYTHONPATH=/opt/sqlglot:/mutants", "--env", f"LABEL_OUT=/out/{tag}",
+           IMAGE, "python", "-m", "pytest", *args, "-p", "label_plugin", "-p", "no:cacheprovider",
+           "-q", "--timeout", "300"]
     try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=RUN_TIMEOUT)
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
     except subprocess.TimeoutExpired:
         subprocess.run(["docker", "kill", CONTAINER], capture_output=True)
-        return None, None, "timeout"
-    if not os.path.exists(out):
-        return None, None, "no_result"
-    r = json.load(open(out))
-    return set(r["failed"]), set(r["ok"]), "ok"
+        return None
+    # One file per pytest process (main / xdist controller and every worker):
+    # subtest failures are only seen by the worker that ran the test.
+    files = glob.glob(os.path.join(RAW, f"{tag}.*.json"))
+    if not any(f.endswith(".main.json") for f in files):
+        return None
+    failed, ok = set(), set()
+    for f in files:
+        r = json.load(open(f))
+        failed |= set(r["failed"])
+        ok |= set(r["ok"])
+    return failed, ok
+
+
+def run_suite(mid, jobs, all_ids):
+    """Full suite on WORK. -> (failing ids, status, n_flaky).
+
+    Phase 1: everything but the executor tests, xdist with --dist loadscope (one
+    worker per test class, so TestOptimizer's process pool exists once).
+    Phase 2: the executor tests alone (they parallelise internally).
+    Phase 3: every test that failed or never reported is re-run serially; only
+    the ones that fail again count. Parallel runs on a 4 GB Docker VM can fail a
+    heavy test spuriously (seen on the clean tree), and a wrong label is worse
+    than a slow one. Skipped when more than CONFIRM_MAX fail (syntax errors etc.).
+    """
+    t_end = time.time() + RUN_TIMEOUT
+    r1 = pytest_run(f"{mid}.p1", ["tests", "--ignore", EXECUTOR, "-n", str(jobs),
+                                  "--dist", "loadscope"], max(60, t_end - time.time()))
+    r2 = pytest_run(f"{mid}.p2", [EXECUTOR], max(60, t_end - time.time()))
+    if r1 is None or r2 is None:
+        return None, "timeout_or_no_result", 0
+    failed, ok = r1[0] | r2[0], r1[1] | r2[1]
+    suspects = {i for i in all_ids if i in failed or i not in ok}
+    if not suspects or len(suspects) > CONFIRM_MAX:
+        return suspects, "ok", 0
+    r3 = pytest_run(f"{mid}.p3", sorted(suspects), max(60, t_end - time.time()))
+    if r3 is None:
+        return suspects, "ok_unconfirmed", 0
+    confirmed = {i for i in suspects if i in r3[0] or i not in r3[1]}
+    return confirmed, "ok", len(suspects) - len(confirmed)
 
 
 def prepare_work(patch_path):
@@ -74,16 +113,30 @@ def prepare_work(patch_path):
     shutil.copytree(PRISTINE, WORK, symlinks=True)
     if patch_path is None:
         return True
-    r = subprocess.run(["git", "apply", "--whitespace=nowarn", patch_path], cwd=WORK,
-                       capture_output=True, text=True)
+    # WORK lives inside our own git repo. Inside a repo's subdirectory, `git apply`
+    # SILENTLY SKIPS paths outside that subdirectory, so stop repo discovery at
+    # mutants_out/ and treat WORK as a plain folder.
+    env = dict(os.environ, GIT_CEILING_DIRECTORIES=MO)
+    r = subprocess.run(["git", "apply", "--whitespace=nowarn", os.path.abspath(patch_path)],
+                       cwd=WORK, capture_output=True, text=True, env=env)
     if r.returncode:
         log(f"  git apply failed: {r.stderr.strip()[:200]}")
-    return r.returncode == 0
+        return False
+    # Prove it applied: every file the patch touches must now differ from pristine.
+    for line in open(patch_path):
+        if line.startswith("+++ b/"):
+            p = line[6:].rstrip("\n")
+            old = os.path.join(PRISTINE, p)
+            new = os.path.join(WORK, p)
+            if os.path.exists(old) and open(old, "rb").read() == open(new, "rb").read():
+                log(f"  patch did not change {p}")
+                return False
+    return True
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--jobs", type=int, default=4)
+    ap.add_argument("--jobs", type=int, default=3)
     ap.add_argument("--limit", type=int, default=0, help="label at most N patches this run")
     args = ap.parse_args()
     for d in (PENDING, COMMITS, RAW):
@@ -93,8 +146,10 @@ def main():
     shutil.copy(os.path.join(REPO, "sample", "tests.json"), os.path.join(MO, "tests.json"))
     number = {t["id"]: t["number"] for t in tj["tests"]}
 
-    def failing_numbers(failed, ok):
-        return sorted(n for i, n in number.items() if i in failed or i not in ok)
+    def label(mid):
+        failing, status, flaky = run_suite(mid, args.jobs, number)
+        nums = sorted(number[i] for i in failing) if failing is not None else None
+        return nums, status, flaky
 
     ans_path = os.path.join(MO, "answers.json")
     answers = json.load(open(ans_path)) if os.path.exists(ans_path) else {"commits": {}}
@@ -107,11 +162,12 @@ def main():
         log("baseline: labelling the clean tree (must be 0 failing)")
         prepare_work(None)
         t0 = time.time()
-        failed, ok, status = run_suite("baseline", args.jobs)
-        fails = failing_numbers(failed, ok) if status == "ok" else None
-        write_json(base_path, {"status": status, "failing": fails, "seconds": round(time.time() - t0)})
-        log(f"baseline: {status}, failing={fails}, {time.time() - t0:.0f} s")
+        fails, status, flaky = label("baseline")
+        write_json(base_path, {"status": status, "failing": fails, "flaky": flaky,
+                               "seconds": round(time.time() - t0)})
+        log(f"baseline: {status}, failing={fails}, flaky={flaky}, {time.time() - t0:.0f} s")
         if status != "ok" or fails:
+            os.remove(base_path)
             sys.exit("Baseline is not clean: fix the environment before labelling mutants.")
     base_secs = json.load(open(base_path))["seconds"]
 
@@ -121,7 +177,7 @@ def main():
     if os.path.exists(log_path):
         for line in open(log_path):
             r = json.loads(line)
-            if r["status"] in ("apply_failed", "timeout", "no_result"):
+            if r["status"] in ("apply_failed", "timeout_or_no_result"):
                 skipped.add(r["id"])
     todo = [m for m in todo if m not in skipped]
     if args.limit:
@@ -134,22 +190,23 @@ def main():
         meta_path = os.path.join(PENDING, f"{mid}.json")
         meta = json.load(open(meta_path)) if os.path.exists(meta_path) else {"kind": "code"}
         t0 = time.time()
+        flaky = 0
         if not prepare_work(patch):
             status, fails = "apply_failed", None
         else:
-            failed, ok, status = run_suite(mid, args.jobs)
-            fails = failing_numbers(failed, ok) if status == "ok" else None
+            fails, status, flaky = label(mid)
         secs = time.time() - t0
         times.append(secs)
-        if status == "ok":
+        if status.startswith("ok"):
             shutil.copy(patch, os.path.join(COMMITS, f"{mid}.patch"))
             answers["commits"][mid] = {"failing": fails, "kind": meta["kind"],
-                                       "detail": meta.get("detail"), "where": meta.get("where")}
+                                       "detail": meta.get("detail"), "where": meta.get("where"),
+                                       "confirmed": status == "ok"}
             write_json(ans_path, answers)
         with open(log_path, "a") as f:
             f.write(json.dumps({"id": mid, "status": status, "seconds": round(secs),
                                 "n_failing": None if fails is None else len(fails),
-                                "detail": meta.get("detail")}) + "\n")
+                                "flaky_dropped": flaky, "detail": meta.get("detail")}) + "\n")
         avg = sum(times[-10:]) / len(times[-10:])
         eta = avg * (len(todo) - k)
         log(f"[{k}/{len(todo)}] {mid} {meta.get('detail', ''):17} {status:12} "
