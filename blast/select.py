@@ -734,15 +734,24 @@ class _File:
         return self.out
 
 
+# DIAG (selector.py): the categories of the last select() call's non-NOOP files.
+LAST_CATS: set[str] = set()
+
+
 def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]:
     """Union over CHANGED and DATA files, plus rule f. Raises Full."""
     out: set[int] = set()
     trail: list[str] = []
     wide = False
+    LAST_CATS.clear()
     for v in verdicts:
         if v.kind == prover.CHANGED:
             f = _File(ctx, v.path)
             f.run(v)
+            if not v.path.startswith("sqlglot/") or ctx.unused(v.path):
+                LAST_CATS.add("other")
+            else:  # A: def bodies only (rules a/c); B: import-time code (class_users, attr/key, names)
+                LAST_CATS.add("B" if f.import_time else "A")
             if INFECTION and v.path.startswith("sqlglot/") and v.path.endswith(".py"):
                 f.infect(v)
             out |= f.out
@@ -755,6 +764,7 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
                     f.note(f"g:import sqlglot+{len(ctx.subprocess_import_tests)}")
             trail.append(f"{v.path}: {' '.join(f.notes)}")
         elif v.kind == prover.BROKEN:
+            LAST_CATS.add("other")
             f = _File(ctx, v.path)
             out |= f.broken()
             trail.append(f"{v.path}: {' '.join(f.notes)}")
@@ -773,6 +783,7 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
                 rule = "e:fixture-name"
             if not t:
                 raise Full(f"no test reads {v.path}")
+            LAST_CATS.add("C" if v.path.startswith("tests/fixtures/") else "other")
             out |= t
             trail.append(f"{v.path}: {rule}+{len(t)}")
         elif v.kind != prover.NOOP:

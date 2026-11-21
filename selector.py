@@ -29,6 +29,11 @@ if HEAVY_REPLAY not in ("0", "static", "1"):
     HEAVY_REPLAY = "static"
 TMP = Path(os.environ.get("TMPDIR", "/tmp"))
 SRC = Path(os.environ.get("SQLGLOT_SRC", "/opt/sqlglot"))
+# DIAG (diagnostic branches only, never on main): letters A-D. A commit whose selection comes ONLY
+# from that category outputs [] instead. A = changed def bodies (line map / def fallback),
+# B = import-time code (class_users, attr/key, module-name chain), C = fixture files,
+# D = FULL (every test selected). Commits mixing categories keep their selection.
+DIAG = frozenset(c for c in os.environ.get("DIAG", "").upper() if c in "ABCD")
 
 
 def select(commit: str, patch_text: str, all_tests: list[int], ctx_factory, replayer=None
@@ -82,17 +87,35 @@ def main() -> None:
                 if HEAVY_REPLAY != "0" else None)
 
     out = []
+    cats: dict[str, int] = {}
     for patch in sorted((DATA / "commits").glob("*.patch")):
         commit = patch.stem
         try:
             text = patch.read_bytes().decode("utf-8", "replace")
+            sel.LAST_CATS.clear()
             selected, reason = select(commit, text, all_tests, ctx_factory, replayer)
+            if selected is all_tests:
+                cat = "D"
+            elif not selected:
+                cat = "empty"
+            elif len(sel.LAST_CATS) == 1:
+                cat = next(iter(sel.LAST_CATS))
+            else:
+                cat = "mixed" if sel.LAST_CATS else "other"
+            cats[cat] = cats.get(cat, 0) + 1
+            if cat in DIAG:
+                selected, reason = [], f"DIAG {cat} -> [] (was: {reason})"
             workers = full if selected is all_tests else pack([(n, ms[n]) for n in selected])
         except Exception as e:  # noqa: BLE001 - never crash the run
             workers, reason = full, f"FULL exception {type(e).__name__}: {e}"
+            cats["D"] = cats.get("D", 0) + 1
+            if "D" in DIAG:
+                workers, reason = [], f"DIAG D -> [] (was: {reason})"
         log(f"{commit} {reason}")
         out.append(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")))
 
+    log("DIAG categories (commits): " + ", ".join(f"{k}={cats.get(k, 0)}" for k in
+        ("A", "B", "C", "D", "mixed", "other", "empty")) + f"; DIAG={''.join(sorted(DIAG)) or 'off'}")
     sys.stdout.write("".join(line + "\n" for line in out))
     sys.stdout.flush()
     import resource
