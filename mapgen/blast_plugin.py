@@ -64,6 +64,51 @@ builtins.open = _tracking_open
 io.open = _tracking_open
 
 
+# ---------------------------------------------------------------- process pools
+# tests/test_optimizer.py and tests/test_executor.py run work in a
+# ProcessPoolExecutor (spawn). Coverage in this process cannot see those
+# workers, so their lines would be credited to no test. Run pool jobs inline
+# instead, in this process, under the current test's context. Patched before
+# collection, so `from concurrent.futures import ProcessPoolExecutor` in the
+# test modules picks this up.
+import concurrent.futures  # noqa: E402
+import concurrent.futures.process  # noqa: E402
+import pickle  # noqa: E402
+
+
+class _InlineExecutor(concurrent.futures.Executor):
+    """Synchronous stand-in for ProcessPoolExecutor, MAP-BUILDING ONLY.
+
+    Arguments and results go through pickle like a real worker's would, so
+    pickling code (sqlglot's serde.dump / serde.load via __reduce__) still runs
+    and is credited to the test. map(), shutdown() and `with` come from Executor.
+    """
+
+    def __init__(self, max_workers=None, mp_context=None, initializer=None,
+                 initargs=(), **kwargs):
+        if initializer is not None:
+            initializer(*pickle.loads(pickle.dumps(tuple(initargs))))
+
+    def submit(self, fn, /, *args, **kwargs):
+        f = concurrent.futures.Future()
+        try:
+            a, k = pickle.loads(pickle.dumps((args, kwargs)))
+            f.set_result(pickle.loads(pickle.dumps(fn(*a, **k))))
+        except BaseException as e:  # noqa: BLE001 - mirror a worker's failure
+            f.set_exception(e)
+        return f
+
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        pass
+
+
+concurrent.futures.ProcessPoolExecutor = _InlineExecutor
+concurrent.futures.process.ProcessPoolExecutor = _InlineExecutor
+for _name, _mod in list(sys.modules.items()):  # any test module already imported
+    if _name.startswith("tests") and getattr(_mod, "ProcessPoolExecutor", None) is not None:
+        _mod.ProcessPoolExecutor = _InlineExecutor
+
+
 # ---------------------------------------------------------------- class_users
 # Import every sqlglot module now, in the "" context, so lazily loaded dialects,
 # parsers and generators count as import-time lines instead of being credited

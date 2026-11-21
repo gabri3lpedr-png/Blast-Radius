@@ -52,6 +52,17 @@ via_class = set().union(*(users(m["class_users"][k]) for k in cls)) if cls else 
 check("Dremio REGEXP_SPLIT reaches test_regexp_split", t in via_lines or t in via_class,
       f"(lines {hits}: {t in via_lines}; {cls}: {t in via_class})")
 
+# 4. Process-pool work is credited (map v2): test_tpcds reaches eliminate_joins.py
+t = "tests/test_optimizer.py::TestOptimizer::test_tpcds"
+ej = m["lines"].get("sqlglot/optimizer/eliminate_joins.py", {})
+n = sum(t in users(si) for si in ej.values())
+check("test_tpcds covers sqlglot/optimizer/eliminate_joins.py", n > 0, f"({n} lines)")
+
+# 5. serde.py:53 (pickling expressions for pool workers) credited to ~37 tests
+si = m["lines"].get("sqlglot/serde.py", {}).get("53")
+n = len(sets[si]) if si is not None else 0
+check("serde.py:53 credited to ~37 tests", n >= 30, f"({n} tests)")
+
 # Bonus: a hot parser line should be credited to many tests, not one.
 hot = max(m["lines"]["sqlglot/parser.py"].values(), key=lambda i: len(sets[i]))
 check("hot parser.py line credited to many tests", len(sets[hot]) > 100, f"({len(sets[hot])} tests)")
