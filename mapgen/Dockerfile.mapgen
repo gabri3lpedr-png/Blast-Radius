@@ -1,0 +1,28 @@
+# Labelling environment: runs sqlglot's tests the way the organisers did.
+# Used only to BUILD maps (and later the mutant practice set). Never shipped.
+FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
+
+ARG SQLGLOT_COMMIT=eb11aec4be8cb2122afe713a4816662c3f0fb2fa
+
+# sqlglot at the pinned commit, without apt or git.
+ADD https://github.com/tobymao/sqlglot/archive/${SQLGLOT_COMMIT}.tar.gz /tmp/sqlglot.tgz
+RUN python - <<'EOF'
+import os, shutil, tarfile
+with tarfile.open("/tmp/sqlglot.tgz") as t:
+    top = t.getmembers()[0].name.split("/")[0]
+    t.extractall("/tmp/x", filter="data")
+shutil.move(f"/tmp/x/{top}", "/opt/sqlglot")
+os.remove("/tmp/sqlglot.tgz")
+EOF
+
+COPY requirements.lock /tmp/requirements.lock
+RUN pip install --no-cache-dir -r /tmp/requirements.lock coverage==7.17.4
+
+ENV SKIP_INTEGRATION=0 \
+    PYTHONPATH=/opt/sqlglot \
+    COVERAGE_CORE=sysmon \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /opt/sqlglot
+COPY mapgen/run_baseline.sh /usr/local/bin/run_baseline.sh
+RUN chmod 755 /usr/local/bin/run_baseline.sh
