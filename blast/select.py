@@ -50,6 +50,7 @@ import ast
 import gzip
 import json
 import os
+import re
 from pathlib import Path
 
 from blast import attrs, infection, prover, rescue, safe
@@ -134,6 +135,13 @@ RESCUE_NOTHING = os.environ.get("RESCUE_NOTHING", "1") == "1"
 # def or rule x), unless some other rule (line map, def, class_users at the changed file, rule
 # s/g/f, fixtures, ...) also added it. The ablation measured by tools/rule_report.py.
 NO_CHAIN = os.environ.get("NO_CHAIN", "1") == "1"
+# NO_CHAIN_MODE (only with NO_CHAIN=1):
+#  all = drop every chain-only test (716b411; misses n0ca83 in mutants_new).
+#  a   = as all, but a changed file whose own selection would become empty keeps its chain tests.
+#  b   = a, and for a per-dialect module (sqlglot/<pkg>/<d>.py with tests/dialects/test_<d>.py) also
+#        keep the chain tests in tests/dialects/test_<d>.py and the optimizer annotate/typing tests.
+NO_CHAIN_MODE = os.environ.get("NO_CHAIN_MODE", "b").strip().lower()
+_TYPING_TEST = re.compile(r"annotat|typ", re.I)
 
 # Rule g. Tests that run `import sqlglot` in a subprocess (ids, never numbers).
 SUBPROCESS_IMPORT_TESTS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
@@ -949,6 +957,23 @@ class _File:
         return not rescue.mentions(self.ctx.src, [top, name])
 
 
+def _dialect_keep(ctx: Ctx, path: str) -> frozenset[int]:
+    """NO_CHAIN_MODE=b: for sqlglot/<pkg>/<d>.py with tests/dialects/test_<d>.py, that file's tests
+    plus tests/test_optimizer.py's annotate/typing tests; else nothing."""
+    parts = path.split("/")
+    if len(parts) != 3 or parts[0] != "sqlglot" or not parts[2].endswith(".py"):
+        return frozenset()
+    own = ctx.tests_by_file.get(f"tests/dialects/test_{parts[2][:-3]}.py")
+    if not own:
+        return frozenset()
+    typ = ctx.__dict__.get("_nochain_typing")
+    if typ is None:
+        typ = frozenset(n for i, n in ctx.number_by_id.items()
+                        if i.startswith("tests/test_optimizer.py::") and _TYPING_TEST.search(i.rsplit("::", 1)[-1]))
+        ctx._nochain_typing = typ
+    return own | typ
+
+
 def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]:
     """Union over CHANGED and DATA files, plus rule f. Raises Full."""
     out: set[int] = set()
@@ -956,6 +981,7 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
     wide = False
     chain: set[int] = set()  # NO_CHAIN
     other: set[int] = set()
+    chain_files: list[_File] = []
     for v in verdicts:
         if v.kind == prover.CHANGED:
             f = _File(ctx, v.path)
@@ -964,6 +990,7 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
                 f.infect(v)
             chain |= f.chain_hits
             other |= f.other_hits
+            chain_files.append(f)
             out |= f.out
             wide |= f.wide
             if f.import_time and v.path.startswith("sqlglot/"):
@@ -1018,6 +1045,17 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
             trail.append(f"f:+{len(extra)}")
     if NO_CHAIN:  # after rule f, as the ablation: f's extras are computed from the full selection
         drop = (chain - other - ctx.subprocess_import_tests) & out
+        chain_only = set(drop)
+        if NO_CHAIN_MODE == "b":
+            for f in chain_files:
+                drop -= f.chain_hits & _dialect_keep(ctx, f.path)
+        if NO_CHAIN_MODE in ("a", "b"):
+            for f in chain_files:
+                if f.out and not (f.out - drop):
+                    drop -= f.chain_hits
+                    trail.append(f"nochain:keep {f.path.rsplit('/', 1)[-1]}")
+        if chain_only - drop:
+            trail.append(f"nochain:kept {len(chain_only - drop)}")
         if drop:
             out -= drop
             trail.append(f"nochain:-{len(drop)}")
