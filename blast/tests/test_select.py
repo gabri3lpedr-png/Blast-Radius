@@ -270,9 +270,24 @@ class RulesTest(unittest.TestCase):
             prover.SYNTAX_LAZY = old
 
     def test_c_dead_line_alone_is_full(self):
-        for fl in (False, True):
-            with self.assertRaises(sel.Full):
-                self.run_sel({"sqlglot/mod.py": ("    return 0\n", "    return 1\n")}, func_level=fl)
+        old = sel.INERT_EMPTY
+        sel.INERT_EMPTY = False
+        try:
+            for fl in (False, True):
+                with self.assertRaises(sel.Full):
+                    self.run_sel({"sqlglot/mod.py": ("    return 0\n", "    return 1\n")}, func_level=fl)
+        finally:
+            sel.INERT_EMPTY = old
+
+    def test_c_dead_line_alone_is_empty_with_inert_empty(self):
+        old = sel.INERT_EMPTY
+        sel.INERT_EMPTY = True
+        try:
+            for fl in (False, True):
+                got = self.run_sel({"sqlglot/mod.py": ("    return 0\n", "    return 1\n")}, func_level=fl)
+                self.assertEqual(set(got[0] if isinstance(got, tuple) else got), set())
+        finally:
+            sel.INERT_EMPTY = old
 
     def test_c_dead_line_contributes_nothing(self):
         orig = (self.src / "sqlglot/mod.py").read_text("utf-8")

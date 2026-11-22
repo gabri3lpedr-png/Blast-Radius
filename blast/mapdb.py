@@ -73,6 +73,10 @@ class MapDB:
         class bodies) has import_lines but no per-test "lines"; it is mapped all the same."""
         return path in self._lines_raw or path in self._import_raw
 
+    def has_test_lines(self, path: str) -> bool:
+        """The map credits some test with a line of this file (import_lines do not count)."""
+        return bool(self._lines_raw.get(path))
+
     def line_set_ids(self, path: str, lines) -> set[int]:
         """The map set indexes of the tests that ran any of `lines` (one per distinct line set)."""
         d = self._file_lines(path)

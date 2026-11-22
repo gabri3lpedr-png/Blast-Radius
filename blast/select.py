@@ -103,6 +103,20 @@ MODULE_NAMES = os.environ.get("MODULE_NAMES", "1") == "1"
 # import line itself is kept as a use (rule b follows the ALIAS it binds in P, or the tests that ran
 # it when it sits in a def); P's other bare uses of NAME cannot mean D's binding and are dropped.
 ALIAS_IMPORTS = os.environ.get("ALIAS_IMPORTS", "1") == "1"
+# INERT_EMPTY=1: a sqlglot/ file whose every changed line is proven inert selects nothing instead of
+# FULL. Inert = a def body line the map credits no test with, not even through its whole def
+# (rule c DEAD: no test calls that def; pool workers ran inline at map time, and code the
+# `import sqlglot` subprocess runs is import-time, never DEAD), or a line inside the body of an
+# `if TYPE_CHECKING:` block (never runs). Any other line that finds nothing still goes FULL.
+INERT_EMPTY = os.environ.get("INERT_EMPTY", "1") == "1"
+# MAIN_UNUSED=1: sqlglot/__main__.py (the `python -m sqlglot` CLI) is unused when the map credits no
+# test with any of its lines: no test imports or runs it (tests/test_docs.py skips it by name), its
+# import_lines come only from the map's own import-all walk.
+MAIN_UNUSED = os.environ.get("MAIN_UNUSED", "1") == "1"
+# COMPOUND_NAMES=1: a module-level `try:` or `if` (not TYPE_CHECKING) that binds no plain names itself
+# follows the names bound by every simple statement nested in it (rule b name chain). Anything else
+# nested (a call statement, a loop, ...) or a call in the `if` test -> FULL as before.
+COMPOUND_NAMES = os.environ.get("COMPOUND_NAMES", "1") == "1"
 
 # Rule g. Tests that run `import sqlglot` in a subprocess (ids, never numbers).
 SUBPROCESS_IMPORT_TESTS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
@@ -116,6 +130,50 @@ IMPORT_SQLGLOT = frozenset({
     "sqlglot/errors.py", "sqlglot/parsers/__init__.py", "sqlglot/parsers/base.py",
     "sqlglot/typing/__init__.py",
 })
+
+
+def _compound_names(top) -> list[str] | None:
+    """Names bound by a module-level try/if through its nested simple statements, or None."""
+    if not isinstance(top, (ast.Try, ast.If)):
+        return None
+    if isinstance(top, ast.If) and any(isinstance(n, ast.Call) for n in ast.walk(top.test)):
+        return None
+    out: list[str] = []
+
+    def stmts(body) -> bool:
+        for st in body:
+            if isinstance(st, (ast.Try, ast.If)):
+                if isinstance(st, ast.If) and any(isinstance(n, ast.Call) for n in ast.walk(st.test)):
+                    return False
+                parts = [st.body, st.orelse] + ([h.body for h in st.handlers] + [st.finalbody]
+                                                if isinstance(st, ast.Try) else [])
+                if not all(stmts(b) for b in parts):
+                    return False
+            elif isinstance(st, (ast.Pass, ast.Raise)):
+                continue
+            elif isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant):
+                continue
+            else:
+                names = names_bound(st)
+                if names is None:
+                    return False
+                out.extend(names)
+        return True
+
+    parts = [top.body, top.orelse] + ([h.body for h in top.handlers] + [top.finalbody]
+                                      if isinstance(top, ast.Try) else [])
+    return out if all(stmts(b) for b in parts) and out else None
+
+
+def _type_checking_body(top, line: int) -> bool:
+    """True when `line` lies in the body (not the test, not the else) of `if TYPE_CHECKING:`."""
+    if not isinstance(top, ast.If) or not top.body:
+        return False
+    t = top.test
+    name = t.id if isinstance(t, ast.Name) else t.attr if isinstance(t, ast.Attribute) else None
+    if name != "TYPE_CHECKING":
+        return False
+    return top.body[0].lineno <= line <= top.body[-1].end_lineno
 
 
 class Full(Exception):
@@ -275,6 +333,9 @@ class Ctx:
         if not path.endswith(".py") or not path.startswith(("sqlglot/", "tests/")):
             return False
         name = path.rsplit("/", 1)[-1]
+        if (MAIN_UNUSED and path == "sqlglot/__main__.py" and not self.db.has_test_lines(path)
+                and g.never_imported(path)):
+            return True
         if path.startswith("tests/") and name.startswith("test_") and not self.tests_by_file.get(path):
             return not (g.top_importers.get(path) or g.lazy_sites.get(path))
         return g.never_imported(path) and not self.db.has_file(path) and not self.loaded_by_import_sqlglot(path)
@@ -518,6 +579,10 @@ class _File:
         if loc.top is None:
             return  # blank/comment line at module level: neighbours were looked up in a)
         names = names_bound(loc.top)
+        if names is None and COMPOUND_NAMES:
+            names = _compound_names(loc.top)
+            if names is not None:
+                self.note(f"b:compound {type(loc.top).__name__} {','.join(names)}")
         if names is None:
             raise Full(f"{path}:{loc.line} module-level statement binds no plain names")
         if safe.on("B"):
@@ -571,7 +636,8 @@ class _File:
         self.note(f"b:name {name}+{len(self.out) - before}")
 
     # -- rules a-c for one changed ORIGINAL line ------------------------------------------
-    def changed_line(self, loc: Loc) -> None:
+    def changed_line(self, loc: Loc) -> bool:
+        """Looks the line up; True when it is proven inert (DEAD def body, TYPE_CHECKING body)."""
         ctx, path = self.ctx, self.path
         imp = ctx.db.import_lines(path)
         if loc.kind == "def_body" and safe.on("C"):
@@ -591,11 +657,16 @@ class _File:
                 if safe.on("E"):
                     raise Full(f"SAFE E: {path}:{loc.line} dead line")
                 self.note(f"DEAD L{loc.line}")
-            return
+                return True
+            return False
+        if INERT_EMPTY and not loc.classes and _type_checking_body(loc.top, loc.line):
+            self.note(f"t:TYPE_CHECKING L{loc.line}")
+            return True
         self.import_time = True  # module level, class body or def header
         if loc.kind == "def_header":
             self.map_lines(path, _def_lines(loc.func), f"b:def {loc.func.name}")
         self.import_effect(path, loc, 0)
+        return False
 
     # -- rule x: a file that no longer parses -----------------------------------------------
     def broken(self) -> set[int]:
@@ -719,12 +790,13 @@ class _File:
         if not v.lines:
             raise Full(f"{path}: no changed original lines")
         orig = ctx.locator(path)
+        all_inert = not is_test
         for line in v.lines:
             loc = orig.locate(line)
             if is_test:
                 self.test_line(loc)
             else:
-                self.changed_line(loc)
+                all_inert &= self.changed_line(loc)
         added = _added_new_lines(v.fp) if v.fp is not None else []
         if added:
             try:
@@ -735,12 +807,19 @@ class _File:
                 loc = new.locate(line)
                 if loc.kind == "def_body":
                     continue  # runtime code: covered by the original neighbour lines
+                if INERT_EMPTY and not is_test and not loc.classes and _type_checking_body(loc.top, loc.line):
+                    self.note(f"t:TYPE_CHECKING +L{line}")
+                    continue
+                all_inert = False
                 self.import_time = True
                 if is_test:
                     self.test_line(loc)
                 else:
                     self.import_effect(path, loc, 0)
         if not self.out:
+            if INERT_EMPTY and all_inert:
+                self.note("n:every changed line inert")
+                return self.out
             raise Full(f"map lookup found nothing for {path}")
         return self.out
 
