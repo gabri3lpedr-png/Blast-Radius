@@ -188,6 +188,7 @@ class RulesTest(unittest.TestCase):
         (cls.index / "imports.json").write_text(json.dumps(imports.build(cls.src)), "utf-8")
         (cls.index / "subclasses.json").write_text(
             json.dumps(build_index.subclass_index(cls.src, require_generator=False)), "utf-8")
+        (cls.index / "import_used.json").write_text(json.dumps({"used": []}), "utf-8")
         cls.import_mods = build_index.import_sqlglot_modules(cls.src)
         (cls.index / "import_sqlglot.json").write_text(json.dumps(cls.import_mods), "utf-8")
         files_of = {IDS[i]: IDS[i].split("::")[0] for i in range(len(IDS))}
@@ -636,6 +637,30 @@ class AttrLevelTest(RulesTest):
         raw = {**ATTR_MAP, "attr_import": [_K + "Sub.NAME"]}
         got, trail = self.sel_kinds('    NAME = "base"\n', '    NAME = "other"\n', raw)
         self.assertEqual(got, CLASS_USERS, trail)
+
+    def test_read_at_import_of_a_class_used_at_import_is_full(self):
+        # ATTR_IMPORT_FULL: generators/duckdb.py parses SQL in its class body (builds Select), so
+        # a Select.arg_types edit breaks test COLLECTION, credited to no test
+        raw = {**ATTR_MAP, "attr_import": [_K + "Sub.NAME"]}
+        ctx = self.ctx(raw=raw)
+        ctx.import_used_path = self.index / "import_used_sub.json"
+        ctx.import_used_path.write_text(json.dumps({"used": [_K + "Sub"]}), "utf-8")
+        orig = (self.src / "sqlglot/kinds.py").read_text("utf-8")
+        text = patch_for("sqlglot/kinds.py", orig, orig.replace('    NAME = "base"\n', '    NAME = "other"\n'))
+        verdicts = [prover.classify(fp, self.src) for fp in diff.parse(text)]
+        with self.assertRaises(sel.Full) as cm:
+            sel.select(ctx, verdicts)
+        self.assertIn("ATTR_IMPORT_FULL", str(cm.exception))
+
+    def test_read_at_import_without_import_used_index_is_full(self):
+        raw = {**ATTR_MAP, "attr_import": [_K + "Sub.NAME"]}
+        ctx = self.ctx(raw=raw)
+        ctx.import_used_path = Path("/nonexistent/import_used.json")
+        orig = (self.src / "sqlglot/kinds.py").read_text("utf-8")
+        text = patch_for("sqlglot/kinds.py", orig, orig.replace('    NAME = "base"\n', '    NAME = "other"\n'))
+        verdicts = [prover.classify(fp, self.src) for fp in diff.parse(text)]
+        with self.assertRaises(sel.Full):
+            sel.select(ctx, verdicts)
 
     def test_missing_runtime_subclass_index_falls_back(self):
         ctx = self.ctx(raw=ATTR_MAP)

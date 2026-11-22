@@ -11,6 +11,13 @@
                             __subclasses__() after importing EVERY module under sqlglot/ (a fresh,
                             isolated interpreter; __main__ skipped): a class only lists the
                             subclasses that are loaded. ATTR_LEVEL (rule b') reads it.
+<out>/import_used.json      "module:qualname" of every sqlglot class USED while every sqlglot
+                            module imports (same fresh interpreter walk as subclasses.json, under
+                            sys.setprofile): the type of an INSTANCE passed as the first argument
+                            (self) of a sqlglot Python function (classmethods do not count), outside
+                            class-creation hooks (__init_subclass__, a metaclass __new__/__init__).
+                            E.g. generators/duckdb.py parses SQL in its class body, which builds
+                            Select nodes. ATTR_IMPORT_FULL reads it.
 <out>/import_sqlglot.json   sorted source paths of the sqlglot modules a bare `import sqlglot`
                             loads (a fresh, isolated interpreter; sys.modules afterwards).
                             Tests that run `import sqlglot` in a subprocess use it.
@@ -118,6 +125,60 @@ print(json.dumps({"subclasses": {k: sorted(v) for k, v in sorted(out.items())}, 
 """
 
 
+_USED_PROBE = """
+import importlib, json, os, pkgutil, sys
+src = os.path.realpath(sys.argv[1])
+sys.path.insert(0, src)
+pre = src + os.sep + "sqlglot" + os.sep
+HOOKS = {"__init_subclass__", "__new__", "__init__", "__set_name__", "__class_getitem__"}
+used, hook_frames = set(), set()
+def key(c):
+    return f"{c.__module__}:{c.__qualname__}"
+def prof(frame, event, arg):
+    if event == "return":
+        hook_frames.discard(id(frame))
+        return
+    if event != "call":
+        return
+    co = frame.f_code
+    if not co.co_filename.startswith(pre):
+        return
+    first = frame.f_locals.get(co.co_varnames[0]) if co.co_argcount else None
+    if co.co_name in HOOKS and isinstance(first, type) or co.co_name == "__init_subclass__":
+        hook_frames.add(id(frame))
+        return
+    if hook_frames:
+        return
+    if isinstance(first, type):
+        return  # a classmethod (Func.sql_names() for every function at import): not an instance
+    c = type(first)
+    if getattr(c, "__module__", "").startswith("sqlglot"):
+        used.add(key(c))
+sys.setprofile(prof)
+import sqlglot
+for info in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
+    if info.name.split(".")[-1] == "__main__":
+        continue
+    try:
+        importlib.import_module(info.name)
+    except Exception:
+        pass
+sys.setprofile(None)
+print(json.dumps({"used": sorted(used)}))
+"""
+
+
+def import_used(src: Path) -> dict:
+    proc = subprocess.run(
+        [sys.executable, "-I", "-c", _USED_PROBE, str(src)],
+        capture_output=True, text=True, check=True, cwd=str(src),
+    )
+    rec = json.loads(proc.stdout.strip().splitlines()[-1])
+    if "sqlglot.expressions.query:Select" not in rec["used"]:
+        raise RuntimeError("import_used probe did not see Select built at import")
+    return rec
+
+
 def subclass_index(src: Path, require_generator: bool = True) -> dict:
     proc = subprocess.run(
         [sys.executable, "-I", "-c", _SUBCLASS_PROBE, str(src)],
@@ -146,6 +207,9 @@ def main() -> None:
     (out / "subclasses.json").write_text(json.dumps(sub, separators=(",", ":")), "utf-8")
     print(f"wrote {out / 'subclasses.json'} ({len(sub['subclasses'])} classes with subclasses, "
           f"{len(sub['failed'])} modules failed to import: {sub['failed'][:5]})", file=sys.stderr)
+    used = import_used(src)
+    (out / "import_used.json").write_text(json.dumps(used, separators=(",", ":")), "utf-8")
+    print(f"wrote {out / 'import_used.json'} ({len(used['used'])} classes)", file=sys.stderr)
     mods = import_sqlglot_modules(src)
     (out / "import_sqlglot.json").write_text(json.dumps(mods), "utf-8")
     print(f"wrote {out / 'import_sqlglot.json'} ({len(mods)} modules)", file=sys.stderr)
