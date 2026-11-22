@@ -113,6 +113,12 @@ INERT_EMPTY = os.environ.get("INERT_EMPTY", "1") == "1"
 # test with any of its lines: no test imports or runs it (tests/test_docs.py skips it by name), its
 # import_lines come only from the map's own import-all walk.
 MAIN_UNUSED = os.environ.get("MAIN_UNUSED", "1") == "1"
+# INSERT_INERT=1: a pure insertion (no removed line next to it) normally looks up the unchanged
+# original lines just before and after it (blast/apply.py), standing in for the new code. When
+# every inserted line is proven inert in the NEW text (inside `if TYPE_CHECKING:`, or in the body
+# of a def whose ORIGINAL def the map credits no test with, not run at import), those neighbour
+# lines are not looked up for that insertion. Live defs keep the neighbour lookup unchanged.
+INSERT_INERT = os.environ.get("INSERT_INERT", "1") == "1"
 # COMPOUND_NAMES=1: a module-level `try:` or `if` (not TYPE_CHECKING) that binds no plain names itself
 # follows the names bound by every simple statement nested in it (rule b name chain). Anything else
 # nested (a call statement, a loop, ...) or a call in the `if` test -> FULL as before.
@@ -163,6 +169,33 @@ def _compound_names(top) -> list[str] | None:
     parts = [top.body, top.orelse] + ([h.body for h in top.handlers] + [top.finalbody]
                                       if isinstance(top, ast.Try) else [])
     return out if all(stmts(b) for b in parts) and out else None
+
+
+def _insertions(fp) -> list[tuple[int, int, list[int]]]:
+    """Pure insertions as (original line before, original line after, new line numbers),
+    mirroring blast/apply.py: a run of '+' lines with no '-' line in the same run."""
+    out = []
+    for h in fp.hunks:
+        pos = h.old_start if h.old_len == 0 else h.old_start - 1  # 0-based next old line
+        new = h.new_start if h.new_len else h.new_start + 1        # 1-based next new line
+        run_new: list[int] = []
+        minus = False
+        for tag, _ in h.lines:
+            if tag == " ":
+                if run_new and not minus:
+                    out.append((pos, pos + 1, run_new))
+                run_new, minus = [], False
+                pos += 1
+                new += 1
+            elif tag == "-":
+                minus = True
+                pos += 1
+            else:
+                run_new.append(new)
+                new += 1
+        if run_new and not minus:
+            out.append((pos, pos + 1, run_new))
+    return out
 
 
 def _type_checking_body(top, line: int) -> bool:
@@ -748,6 +781,46 @@ class _File:
         if not ctx.tests_by_file.get(path) and not self.out:
             raise Full(f"helper {path}:{loc.line} has no known users")
 
+    def drop_inert_neighbours(self, v: prover.FileVerdict, orig: Locator, lines: list[int]) -> list[int]:
+        """INSERT_INERT: the changed lines minus neighbours that only stand in for inert insertions."""
+        ctx, path = self.ctx, self.path
+        try:
+            new = Locator(v.new_text, path)
+        except (SyntaxError, ValueError):
+            return lines
+        imp = ctx.db.import_lines(path)
+        removed = set(lines)
+        for prev, nxt, added in _insertions(v.fp):
+            removed -= {prev, nxt}
+        keep: set[int] = set(removed)  # lines changed by '-' (or a mixed run): always looked up
+        for prev, nxt, added in _insertions(v.fp):
+            if self._inert_insertion(orig, new, imp, prev, added):
+                self.note(f"n:insert +L{added[0]} inert")
+                continue
+            keep |= {prev, nxt}
+        return [n for n in lines if n in keep]
+
+    def _inert_insertion(self, orig: Locator, new: Locator, imp, prev: int, added: list[int]) -> bool:
+        path = self.path
+        for n in added:
+            loc = new.locate(n)
+            if not loc.classes and _type_checking_body(loc.top, n):
+                continue
+            if loc.kind != "def_body" or prev < 1:
+                return False
+            # the original def holding the insertion point: the line before it is that def's
+            # header or a line of its body
+            d = orig.locate(prev).func
+            if d is None or d.name != loc.func.name or not (d.lineno <= prev <= d.end_lineno):
+                return False
+            span = _def_lines(d)  # like rule c's DEAD test: header included
+            if any(x in imp for x in range(d.body[0].lineno, d.end_lineno + 1)):
+                return False  # its body runs at import
+            base, extra = self.ctx.line_tests(path, span)
+            if base or extra:
+                return False  # a live def: keep the neighbour lookup
+        return True
+
     def infect(self, v: prover.FileVerdict) -> None:
         """INFECTION: narrow this file's own selection when its change is one operator."""
         ctx, path = self.ctx, self.path
@@ -791,7 +864,10 @@ class _File:
             raise Full(f"{path}: no changed original lines")
         orig = ctx.locator(path)
         all_inert = not is_test
-        for line in v.lines:
+        lines = list(v.lines)
+        if INSERT_INERT and not is_test and v.fp is not None and v.new_text:
+            lines = self.drop_inert_neighbours(v, orig, lines)
+        for line in lines:
             loc = orig.locate(line)
             if is_test:
                 self.test_line(loc)

@@ -72,7 +72,7 @@ def main() -> None:
                 f"SYNTAX_LAZY={int(prover.SYNTAX_LAZY)}, IMPORT_FUNC={int(sel.IMPORT_FUNC)}, "
                 f"MODULE_NAMES={int(sel.MODULE_NAMES)}, MAX_DEPTH={sel.MAX_DEPTH}, "
                 f"UNUSED_FILES={int(sel.UNUSED_FILES)}, WIDE_NAMES={int(sel.WIDE_NAMES)}, "
-                f"NOCU_NAMES={int(sel.NOCU_NAMES)}, ALIAS_IMPORTS={int(sel.ALIAS_IMPORTS)}, INERT_EMPTY={int(sel.INERT_EMPTY)}, MAIN_UNUSED={int(sel.MAIN_UNUSED)}, COMPOUND_NAMES={int(sel.COMPOUND_NAMES)}, ATTR_LEVEL={int(sel.ATTR_LEVEL)}, INFECTION={int(sel.INFECTION)}, "
+                f"NOCU_NAMES={int(sel.NOCU_NAMES)}, ALIAS_IMPORTS={int(sel.ALIAS_IMPORTS)}, INERT_EMPTY={int(sel.INERT_EMPTY)}, MAIN_UNUSED={int(sel.MAIN_UNUSED)}, COMPOUND_NAMES={int(sel.COMPOUND_NAMES)}, INSERT_INERT={int(sel.INSERT_INERT)}, ATTR_LEVEL={int(sel.ATTR_LEVEL)}, INFECTION={int(sel.INFECTION)}, "
                 f"SAFE_GROUPS={safe.describe()}")
             ctx = sel.Ctx(SRC, db, tests)
         return ctx
