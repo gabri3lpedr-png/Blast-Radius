@@ -96,6 +96,11 @@ ATTR_LEVEL = os.environ.get("ATTR_LEVEL", "1") == "1"
 # operator would have changed the outcome at least once (maps/infection_map.json.gz). Tests that
 # never evaluated it, setUpClass extras (rule s) and every other rule's tests stay.
 INFECTION = os.environ.get("INFECTION", "1") == "1"
+# CONST_INFECTION=1 (needs INFECTION): a file whose only change is ONE literal of a one-operator
+# Compare (same operator, same position) keeps only the tests whose recorded values of the other
+# side (infection map "cv") may change the Compare's outcome with the new literal. "many",
+# non-builtin or missing values -> kept.
+CONST_INFECTION = os.environ.get("CONST_INFECTION", "1") == "1"
 # MODULE_NAMES=1: a module-level name bound in file D is looked up only where it can mean D's
 # binding: in D itself, as an attribute (x.NAME), or in a file that imports NAME (or *) from D.
 # Re-exports chain through rule b (the importing line binds NAME in the importer).
@@ -872,6 +877,8 @@ class _File:
             return  # the new line must sit where the old one was
         change = infection.single_op_change_at(v.trees[0], v.trees[1], v.lines[0])
         if change is None:
+            if CONST_INFECTION:
+                self.infect_const(v)
             return
         imap = ctx.infection()
         if not imap.ok:
@@ -885,6 +892,24 @@ class _File:
         drop = (self.out & executed) - differs - self.s_extra
         self.out -= drop
         self.note(f"i:L{line} {kind}->{new_op} -{len(drop)}")
+
+    def infect_const(self, v: prover.FileVerdict) -> None:
+        """CONST_INFECTION: the change is one literal of a one-operator Compare."""
+        change = infection.single_const_change_at(v.trees[0], v.trees[1], v.lines[0])
+        if change is None:
+            return
+        imap = self.ctx.infection()
+        if not imap.ok:
+            self.note("k:no infection map")
+            return
+        line, col, side, op, old, new = change
+        executed, differs = imap.lookup_const(self.path, line, col, side, op, old, new)
+        if executed is None:
+            self.note(f"k:L{line} keep ({differs})")
+            return
+        drop = (self.out & executed) - differs - self.s_extra
+        self.out -= drop
+        self.note(f"k:L{line} {old!r}->{new!r} -{len(drop)}")
 
     def run(self, v: prover.FileVerdict) -> set[int]:
         ctx, path = self.ctx, self.path

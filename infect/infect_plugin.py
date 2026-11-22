@@ -23,6 +23,7 @@ instrument.install(ROOT)
 _t0 = time.time()
 
 _contexts = {"": rt.cur}
+_vcontexts = {"": rt.curv}  # CONST: per context {nid: set of value keys | MANY}
 _seen_tests = []
 _failed = {}
 
@@ -64,6 +65,7 @@ for _m in pkgutil.walk_packages(sqlglot.__path__, "sqlglot."):
 
 def _switch(key):
     rt.cur = _contexts.setdefault(key, {})
+    rt.curv = _vcontexts.setdefault(key, {})
 
 
 import pytest  # noqa: E402
@@ -108,6 +110,8 @@ def pytest_unconfigure(config):
         "nodes": rt.NODES,
         "tests": _seen_tests,
         "contexts": {k: {str(n): m for n, m in v.items()} for k, v in _contexts.items()},
+        "values": {k: {str(n): rt.export_values(vs) for n, vs in v.items()} for k, v in _vcontexts.items() if v},
+        "lit": {str(n): side for n, side in rt.LIT.items() if side},
         "failed": _failed,
         "meta": {"run_seconds": round(time.time() - _t0, 1), "import_errors": _import_errors,
                  "python": sys.version.split()[0]},

@@ -27,6 +27,56 @@ NODE_OP: list = []
 FULL: list = []
 
 cur: dict = {}
+# CONST: nid -> 0 (no literal side) / 1 (right side literal: record a) / 2 (left literal: record b)
+LIT: dict = {}
+curv: dict = {}  # current context's {nid: set of value keys | MANY}
+MANY = "many"
+VCAP = 64
+
+
+def _vkey(x, depth=3):
+    """Hashable key of a builtin value (type-tagged so 1/True/1.0 stay distinct), or None."""
+    t = type(x)
+    if x is None or t is bool or t is int or t is float or t is complex or t is str or t is bytes:
+        return (t.__name__, x)
+    if t is tuple and depth > 0 and len(x) <= 32:
+        ks = tuple(_vkey(e, depth - 1) for e in x)
+        if any(k is None for k in ks):
+            return None
+        return ("tuple", ks)
+    return None
+
+
+def vrepr(k):
+    """Value key -> repr of the value (<= 200 chars), or None."""
+    def val(k):
+        return tuple(val(e) for e in k[1]) if k[0] == "tuple" else k[1]
+    r = repr(val(k))
+    return r if len(r) <= 200 else None
+
+
+def export_values(vs):
+    if vs is MANY:
+        return MANY
+    out = [vrepr(k) for k in vs]
+    return MANY if any(r is None for r in out) else sorted(out)
+
+
+def _record(nid, v):
+    s = curv.get(nid)
+    if s is MANY:
+        return
+    k = _vkey(v)
+    if k is None:
+        curv[nid] = MANY
+        return
+    if s is None:
+        curv[nid] = {k}
+    elif k not in s:
+        if len(s) >= VCAP:
+            curv[nid] = MANY
+        else:
+            s.add(k)
 
 _SCALARS = frozenset({type(None), bool, int, float, complex, str, bytes})
 _CONTAINERS = frozenset({tuple, list, set, frozenset, dict})
@@ -88,11 +138,16 @@ def _eq_safe(x) -> bool:
 
 def c(nid, a, b):
     op = NODE_OP[nid]
+    lit = LIT.get(nid, 0)
     try:
         r = OPS[op](a, b)
     except BaseException:
         cur[nid] = FULL[nid]
+        if lit:
+            curv[nid] = MANY
         raise
+    if lit:
+        _record(nid, a if lit == 1 else b)
     m = cur.get(nid)
     full = FULL[nid]
     if m == full:

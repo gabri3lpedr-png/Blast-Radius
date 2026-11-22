@@ -40,6 +40,17 @@ def _bool_context(tree) -> set:
 _PURE_CALLS = {"isinstance", "issubclass"}
 
 
+def _literal(e) -> bool:
+    """CONST map: a number/string/bytes/None/True/False constant, or a tuple of such literals."""
+    if isinstance(e, ast.Constant):
+        return e.value is None or isinstance(e.value, (bool, int, float, complex, str, bytes))
+    if isinstance(e, ast.UnaryOp) and isinstance(e.op, ast.USub) and isinstance(e.operand, ast.Constant):
+        return isinstance(e.operand.value, (int, float, complex)) and not isinstance(e.operand.value, bool)
+    if isinstance(e, ast.Tuple):
+        return all(_literal(x) for x in e.elts)
+    return False
+
+
 def _pure(e) -> bool:
     """Side-effect-free by syntax (assumes attribute reads, constant subscripts and comparisons
     run no side effects, which holds for sqlglot's properties and comparisons)."""
@@ -80,6 +91,9 @@ class _Tx(ast.NodeTransformer):
     def visit_Compare(self, node):
         is_target = len(node.ops) == 1
         nid = self._reg(node, "cmp", CMP_INDEX[type(node.ops[0])]) if is_target else None
+        if is_target:  # CONST: record the other side's values when exactly one side is a literal
+            ll, rl = _literal(node.left), _literal(node.comparators[0])
+            rt.LIT[nid] = 1 if (rl and not ll) else 2 if (ll and not rl) else 0
         self.generic_visit(node)
         if not is_target:
             return node

@@ -56,6 +56,24 @@ def main(raw_path, out_path):
                     alt_sets[n].setdefault(bit, set()).update(owners)
                 m >>= 1
                 bit += 1
+    # CONST: per node, per test, the distinct values of the non-literal side (or "many")
+    tvals = [dict() for _ in range(n_nodes)]  # n -> {test index: set of reprs | MANY}
+    import_vals = {}
+    for key, ctx in raw.get("values", {}).items():
+        for n, vs in ctx.items():
+            n = int(n)
+            if key == "":
+                old = import_vals.get(n, set())
+                import_vals[n] = rt.MANY if (vs == rt.MANY or old == rt.MANY) else old | set(vs)
+                continue
+            for o in scope(key):
+                old = tvals[n].get(o, set())
+                if vs == rt.MANY or old == rt.MANY:
+                    tvals[n][o] = rt.MANY
+                else:
+                    new = old | set(vs)
+                    tvals[n][o] = rt.MANY if len(new) > rt.VCAP else new
+    lit = {int(n): side for n, side in raw.get("lit", {}).items()}
     set_index = {}
     sets = []
 
@@ -76,8 +94,18 @@ def main(raw_path, out_path):
             other = names[1 - op]
             alts = {other: sid(alt_sets[n][0])} if 0 in alt_sets[n] else {}
             imp = [other] if import_alt[n] & 1 else []
-        nodes[f"{path}:{line}:{col}:{kind}"] = {"op": names[op], "end": [eline, ecol], "exec": sid(exec_sets[n]),
-                                                "alt": alts, "import_exec": import_exec[n], "import_alt": imp}
+        e = nodes[f"{path}:{line}:{col}:{kind}"] = {"op": names[op], "end": [eline, ecol], "exec": sid(exec_sets[n]),
+                                                    "alt": alts, "import_exec": import_exec[n], "import_alt": imp}
+        if kind == "cmp" and lit.get(n):
+            groups = {}
+            for t, vs in tvals[n].items():
+                k = rt.MANY if vs == rt.MANY else tuple(sorted(vs))
+                groups.setdefault(k, []).append(t)
+            e["cv"] = {"side": lit[n],
+                       "vals": [[sid(ts), (k if k == rt.MANY else list(k))] for k, ts in groups.items()]}
+            if n in import_vals:
+                iv = import_vals[n]
+                e["cv"]["imp"] = iv if iv == rt.MANY else sorted(iv)
     out = {"version": 1, "sqlglot_commit": "eb11aec4be8cb2122afe713a4816662c3f0fb2fa", "tests": tests,
            "sets": sets, "nodes": nodes, "failed": raw["failed"], "meta": raw["meta"]}
     with gzip.open(out_path, "wt", encoding="utf-8", compresslevel=9) as f:
