@@ -29,6 +29,67 @@ if HEAVY_REPLAY not in ("0", "static", "1"):
     HEAVY_REPLAY = "static"
 TMP = Path(os.environ.get("TMPDIR", "/tmp"))
 SRC = Path(os.environ.get("SQLGLOT_SRC", "/opt/sqlglot"))
+# PROBE_E (probe branch only, never on main): every FULL commit still runs ALL tests (no misses),
+# packed in exactly 4 workers so its cost is 38 s + 1.5 s * MARK[class of its FULL reason]
+# (worker 0 = 30 s + 1.5 s * mark; the suite is 103 s, its longest test 28.8 s). MARKS is a
+# Golomb ruler: any two classes sum to a unique total, so the board total tells which fired.
+PROBE_E = os.environ.get("PROBE_E", "0") == "1"
+MARKS = (0, 1, 5, 12, 25, 27, 35, 41, 44)
+_NAME_CHAIN = ("under another name", "too widely", "too deep", "wide name selects")
+_IMPORT_MISC = ("no class_users", "runs at import", "run at import", "binds no plain names")
+_NOTHING = ("map has no lines", "lookup found nothing", "no changed original lines", "outside sqlglot/",
+            "cannot locate", "no test reads", "SAFE ", "no known users", "nothing imports", "does not locate")
+CLASSES = (
+    ("new file under tests/", lambda r: _first_full(r).startswith("FULL tests/")),
+    ("new file under sqlglot/", lambda r: _first_full(r).startswith("FULL sqlglot/")),
+    ("other new / deleted / rename / binary / no hunks",
+     lambda r: any(k in r for k in ("(new file)", "(deleted file)", "(rename)", "(binary)", "(no hunks"))),
+    ("structural / unrecognised file", lambda r: "(structural file)" in r or "(unrecognised file)" in r),
+    ("syntax error / patch problem",
+     lambda r: any(k in r for k in ("x: ", "does not parse", "patch does not apply", "cannot read original"))),
+    ("name chain: aliased import / too wide / too deep", lambda r: any(k in r for k in _NAME_CHAIN)),
+    ("import-time: no class_users / dunder def / no plain names", lambda r: any(k in r for k in _IMPORT_MISC)),
+    ("lookup found nothing", lambda r: any(k in r for k in _NOTHING)),
+    ("other", lambda r: True),
+)
+
+
+def _first_full(reason: str) -> str:
+    """'FULL <path> (new file)' of the first new-file verdict in the trail, or ''."""
+    for part in reason.split("; "):
+        if "(new file)" in part:
+            while part.startswith("FULL FULL "):
+                part = part[5:]
+            return part
+    return ""
+
+
+def probe_class(reason: str) -> int:
+    for i, (_, test) in enumerate(CLASSES):
+        if test(reason):
+            return i
+    return len(CLASSES) - 1
+
+
+def probe_pack(ms: dict[int, int], mark: int) -> list[list[int]]:
+    """All tests in exactly 4 workers; worker 0 loads exactly 30 s + 1.5 s * mark (as near as the
+    durations allow), the others share the rest (each far below worker 0)."""
+    target = 30_000 + 1_500 * mark
+    order = sorted(ms, key=lambda n: (-ms[n], n))
+    w0, load, rest = [], 0, []
+    for n in order:
+        if load + ms[n] <= target:
+            w0.append(n)
+            load += ms[n]
+        else:
+            rest.append(n)
+    others = [[], [], []]
+    loads = [0, 0, 0]
+    for n in rest:  # LPT onto the lightest of 3
+        i = loads.index(min(loads))
+        others[i].append(n)
+        loads[i] += ms[n]
+    return [w0] + others
 
 
 def select(commit: str, patch_text: str, all_tests: list[int], ctx_factory, replayer=None
@@ -87,9 +148,15 @@ def main() -> None:
         try:
             text = patch.read_bytes().decode("utf-8", "replace")
             selected, reason = select(commit, text, all_tests, ctx_factory, replayer)
-            workers = full if selected is all_tests else pack([(n, ms[n]) for n in selected])
+            selected_all = selected is all_tests
+            workers = full if selected_all else pack([(n, ms[n]) for n in selected])
         except Exception as e:  # noqa: BLE001 - never crash the run
             workers, reason = full, f"FULL exception {type(e).__name__}: {e}"
+            selected_all = True
+        if PROBE_E and selected_all:
+            k = probe_class(reason)
+            workers = probe_pack(ms, MARKS[k])
+            reason = f"PROBE_E class {k} ({CLASSES[k][0]}) mark {MARKS[k]}: {reason}"
         log(f"{commit} {reason}")
         out.append(json.dumps({"commit": commit, "workers": workers}, separators=(",", ":")))
 
