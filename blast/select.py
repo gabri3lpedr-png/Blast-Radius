@@ -113,6 +113,14 @@ INERT_EMPTY = os.environ.get("INERT_EMPTY", "1") == "1"
 # test with any of its lines: no test imports or runs it (tests/test_docs.py skips it by name), its
 # import_lines come only from the map's own import-all walk.
 MAIN_UNUSED = os.environ.get("MAIN_UNUSED", "1") == "1"
+# ATTR_IMPORT_FULL=1: rule b' gave up because a changed class attribute (or dict key) is read at
+# import (attr_import / key_import) -> FULL instead of class_users. Import-time reads include
+# real code, not only class-creation hooks: generators/duckdb.py parses SQL in its class body, so
+# a Select.arg_types edit breaks the COLLECTION of every test module importing duckdb (1419
+# tests), and those reads are credited to no test. class_users (1055) missed 369 of them.
+# Only when the class or a subclass is USED by import-time code (index/import_used.json,
+# blast/build_index.py); a read by a class-creation hook alone keeps the class_users fallback.
+ATTR_IMPORT_FULL = os.environ.get("ATTR_IMPORT_FULL", "1") == "1"
 # COMPOUND_NAMES=1: a module-level `try:` or `if` (not TYPE_CHECKING) that binds no plain names itself
 # follows the names bound by every simple statement nested in it (rule b name chain). Anything else
 # nested (a call statement, a loop, ...) or a call in the `if` test -> FULL as before.
@@ -234,6 +242,8 @@ class Ctx:
         self._alias_lines: dict[str, dict[tuple[str, str], set[int]]] = {}
         self.imports_path = index_dir / "imports.json"
         self.subclasses_path = index_dir / "subclasses.json"
+        self.import_used_path = index_dir / "import_used.json"
+        self._import_used: frozenset[str] | None = None
         self._infection: infection.InfectionMap | None = None
         self._subclasses: dict[str, list[str]] | None = None
         self._imports: ImportGraph | None = None
@@ -373,6 +383,15 @@ class Ctx:
                     todo.append(s)
         return out
 
+    def import_used(self) -> frozenset[str] | None:
+        """Classes used by code that runs while sqlglot modules import (index/import_used.json)."""
+        if self._import_used is None:
+            try:
+                self._import_used = frozenset(json.loads(self.import_used_path.read_text("utf-8"))["used"])
+            except (OSError, ValueError, KeyError, TypeError):
+                return None
+        return self._import_used
+
     def imports(self) -> ImportGraph:
         if self._imports is None:
             try:
@@ -476,6 +495,7 @@ class _File:
         self._attr_cache: dict[tuple[str, ...], frozenset[int] | None] = {}
         self.s_extra: set[int] = set()  # rule s (setUpClass) additions: INFECTION keeps them
         self._new: Locator | None = None  # RESCUE_*: locator of the new text
+        self.attr_import_hit: tuple[str, list[str]] | None = None  # rule b': (why, owners)
 
     # -- rule b': ATTR_LEVEL ------------------------------------------------------------------
     def attr_level(self, classes: list[str]) -> frozenset[int] | None:
@@ -513,6 +533,7 @@ class _File:
             bases = [f"{c}.{name}" for c in owners]
             if any(b in db.attr_import for b in bases) or any(
                     k.startswith(tuple(f"{b}[" for b in bases)) for k in db.key_import):
+                self.attr_import_hit = (f"{name} read at import", owners)
                 return None
             found = [db.attr_users[b] for b in bases if b in db.attr_users]
             if not found:
@@ -526,6 +547,7 @@ class _File:
             # _Dialect.__new__ reads every generator's TRANSFORMS at import to pop JSONPath keys)
             look = [f"{b}[{k}]" for b in bases for k in sorted(spellings | {"*"})]
             if any(k in db.key_import for k in look):
+                self.attr_import_hit = (f"{name}[key] read at import", owners)
                 return None
             found = [db.key_users[k] for k in look if k in db.key_users]
             if not found:
@@ -588,6 +610,13 @@ class _File:
                 if t is not None:
                     self.add(t, f"A:{'.'.join(loc.classes)}")
                     return
+                if ATTR_IMPORT_FULL and self.attr_import_hit:
+                    why, owners = self.attr_import_hit
+                    used = ctx.import_used()
+                    hit = sorted(set(owners) & used) if used is not None else [":(no index)"]
+                    if hit:
+                        raise Full(f"ATTR_IMPORT_FULL: {'.'.join(loc.classes)}.{why}, "
+                                   f"{hit[0].split(':', 1)[1]} used at import")
             for key in loc.class_keys(module_of(path)):
                 t = ctx.db.class_user_tests(key)
                 if t is None and NOCU_NAMES and loc.top is not None and names_bound(loc.top):
