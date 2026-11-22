@@ -64,6 +64,82 @@ def _first_full(reason: str) -> str:
     return ""
 
 
+# PROBE_F (probe branch only): finer split of the two classes probe-E found on the practice set.
+# The board prints exact simulated seconds, so codes are in ms: an import-time commit costs
+# 38 s + 0.1 s * a, a lookup-found-nothing commit 38 s + 1 s * b, anything else 38 s + 20 s.
+PROBE_F = os.environ.get("PROBE_F", "0") == "1"
+A_CODES = ("no plain names: if TYPE_CHECKING", "no plain names: other if", "no plain names: try",
+           "no plain names: expression (call)", "no plain names: other statement",
+           "dunder def run implicitly at import", "other def run at import", "no class_users", "other import-time")
+B_CODES = ("found nothing: sqlglot/, every changed line in a def body",
+           "found nothing: sqlglot/, some line outside def bodies", "found nothing: tests/ file",
+           "no test reads: tests/fixtures/ file", "no test reads: other data file", "map has no lines for file",
+           "no changed original lines", "helper has no known users", "other nothing")
+
+
+def _loc_of(path: str, line: int):
+    from blast.locate import Locator
+    text = (SRC / path).read_bytes().decode("utf-8")
+    return Locator(text, path).locate(line)
+
+
+def probe_f_code(reason: str, patch_text: str) -> tuple[str, int]:
+    """-> ("A", a) / ("B", b) / ("C", 0). Never raises."""
+    import ast
+    import re
+    try:
+        m = re.search(r"(\S+\.py):(\d+) module-level statement binds no plain names", reason)
+        if m:
+            top = _loc_of(m.group(1), int(m.group(2))).top
+            if isinstance(top, ast.If):
+                t = top.test
+                name = t.id if isinstance(t, ast.Name) else t.attr if isinstance(t, ast.Attribute) else ""
+                return "A", 0 if name == "TYPE_CHECKING" else 1
+            if isinstance(top, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+                return "A", 2
+            if isinstance(top, ast.Expr):
+                return "A", 3
+            return "A", 4
+        if "called implicitly" in reason:
+            return "A", 5
+        if "runs at import" in reason or "run at import" in reason:
+            return "A", 6
+        if "no class_users" in reason:
+            return "A", 7
+        m = re.search(r"map lookup found nothing for (\S+)", reason)
+        if m:
+            path = m.group(1).rstrip(";")
+            if path.startswith("tests/"):
+                return "B", 2
+            for fp in diff.parse(patch_text) or []:
+                if fp.path == path:
+                    v = prover.classify(fp, SRC)
+                    kinds = {_loc_of(path, n).kind for n in v.lines}
+                    return "B", 0 if kinds == {"def_body"} else 1
+            return "B", 1
+        m = re.search(r"no test reads (\S+)", reason)
+        if m:
+            return "B", 3 if m.group(1).startswith("tests/fixtures/") else 4
+        if "map has no lines" in reason:
+            return "B", 5
+        if "no changed original lines" in reason:
+            return "B", 6
+        if "no known users" in reason:
+            return "B", 7
+        if probe_class(reason) == 6:
+            return "A", 8
+        if probe_class(reason) == 7:
+            return "B", 8
+    except Exception:  # noqa: BLE001
+        pass
+    return "C", 0
+
+
+def probe_f_pack(ms: dict[int, int], extra_ms: int) -> list[list[int]]:
+    """All tests in exactly 4 workers; cost = 38 s + extra_ms exactly."""
+    return probe_pack(ms, 0, extra_ms)
+
+
 def probe_class(reason: str) -> int:
     for i, (_, test) in enumerate(CLASSES):
         if test(reason):
@@ -71,10 +147,10 @@ def probe_class(reason: str) -> int:
     return len(CLASSES) - 1
 
 
-def probe_pack(ms: dict[int, int], mark: int) -> list[list[int]]:
+def probe_pack(ms: dict[int, int], mark: int, extra_ms: int = 0) -> list[list[int]]:
     """All tests in exactly 4 workers; worker 0 loads exactly 30 s + 1.5 s * mark (as near as the
     durations allow), the others share the rest (each far below worker 0)."""
-    target = 30_000 + 1_500 * mark
+    target = 30_000 + 1_500 * mark + extra_ms
     order = sorted(ms, key=lambda n: (-ms[n], n))
     w0, load, rest = [], 0, []
     for n in order:
@@ -153,7 +229,13 @@ def main() -> None:
         except Exception as e:  # noqa: BLE001 - never crash the run
             workers, reason = full, f"FULL exception {type(e).__name__}: {e}"
             selected_all = True
-        if PROBE_E and selected_all:
+        if PROBE_F and selected_all:
+            g, c = probe_f_code(reason, text)
+            extra = {"A": 100 * c, "B": 1000 * c, "C": 20_000}[g]
+            workers = probe_f_pack(ms, extra)
+            label = {"A": A_CODES, "B": B_CODES}.get(g, ("unclassified",))[c]
+            reason = f"PROBE_F {g}{c} ({label}) +{extra} ms: {reason}"
+        elif PROBE_E and selected_all:
             k = probe_class(reason)
             workers = probe_pack(ms, MARKS[k])
             reason = f"PROBE_E class {k} ({CLASSES[k][0]}) mark {MARKS[k]}: {reason}"

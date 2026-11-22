@@ -50,5 +50,5 @@ ENV HEAVY_REPLAY="static"
 # a one-operator change keeps only the tests where the new operator would change the outcome.
 ENV INFECTION="1"
 # PROBE BRANCH ONLY: encode each FULL commit's reason class in its cost (selector.py PROBE_E).
-ENV PROBE_E="1"
+ENV PROBE_E="0" PROBE_F="1"
 CMD ["python", "/app/selector.py"]
