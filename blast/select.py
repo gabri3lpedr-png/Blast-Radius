@@ -99,6 +99,10 @@ INFECTION = os.environ.get("INFECTION", "1") == "1"
 # binding: in D itself, as an attribute (x.NAME), or in a file that imports NAME (or *) from D.
 # Re-exports chain through rule b (the importing line binds NAME in the importer).
 MODULE_NAMES = os.environ.get("MODULE_NAMES", "1") == "1"
+# ALIAS_IMPORTS=1: `from D import NAME as ALIAS` in file P no longer sends the commit FULL. The
+# import line itself is kept as a use (rule b follows the ALIAS it binds in P, or the tests that ran
+# it when it sits in a def); P's other bare uses of NAME cannot mean D's binding and are dropped.
+ALIAS_IMPORTS = os.environ.get("ALIAS_IMPORTS", "1") == "1"
 
 # Rule g. Tests that run `import sqlglot` in a subprocess (ids, never numbers).
 SUBPROCESS_IMPORT_TESTS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
@@ -157,6 +161,7 @@ class Ctx:
         self.total_ms = sum(self.ms.values())
         self._attr_lines: dict[str, dict[str, set[int]]] = {}
         self._from_imports: dict[str, dict[str, set[str]]] = {}
+        self._alias_lines: dict[str, dict[tuple[str, str], set[int]]] = {}
         self.imports_path = index_dir / "imports.json"
         self.subclasses_path = index_dir / "subclasses.json"
         self._infection: infection.InfectionMap | None = None
@@ -220,6 +225,7 @@ class Ctx:
         tree = self.locator(path).tree
         attrs: dict[str, set[int]] = {}
         froms: dict[str, set[str]] = {}  # imported module -> names (as bound here; "*" = star)
+        alias_lines: dict[tuple[str, str], set[int]] = {}  # (module, NAME) -> lines of `NAME as X`
         is_pkg = path.endswith("__init__.py")
         mod = module_of(path)
         here = mod if is_pkg else mod.rpartition(".")[0]
@@ -237,10 +243,13 @@ class Ctx:
                 for a in n.names:
                     if a.asname and a.asname != a.name:
                         froms.setdefault(src_mod, set()).add(f"{a.name} as {a.asname}")
+                        alias_lines.setdefault((src_mod, a.name), set()).update(
+                            {getattr(a, "lineno", n.lineno), n.lineno})
                     else:
                         froms.setdefault(src_mod, set()).add(a.name)
         self._attr_lines[path] = attrs
         self._from_imports[path] = froms
+        self._alias_lines[path] = alias_lines
 
     def ref_means(self, path: str, line: int, name: str, origin: str) -> bool:
         """MODULE_NAMES: can the use of `name` at path:line be origin's module-level binding?"""
@@ -254,7 +263,9 @@ class Ctx:
         if "*" in names or name in names:
             return True
         if any(n.startswith(f"{name} as ") for n in names):
-            raise Full(f"{path} imports {name} from {origin} under another name")
+            if not ALIAS_IMPORTS:
+                raise Full(f"{path} imports {name} from {origin} under another name")
+            return line in self._alias_lines[path].get((module_of(origin), name), ())
         return False
 
     def unused(self, path: str) -> bool:
