@@ -31,7 +31,7 @@ TMP = Path(os.environ.get("TMPDIR", "/tmp"))
 SRC = Path(os.environ.get("SQLGLOT_SRC", "/opt/sqlglot"))
 # RUN_SMALL (blast/runsmall.py): run a tiny selection (recorded seconds <= RUN_SMALL_T, modelled
 # CPU = STARTUP + RATIO x recorded below its cost) and output only the tests that failed.
-RUN_SMALL = os.environ.get("RUN_SMALL", "0").strip() == "1"
+RUN_SMALL = os.environ.get("RUN_SMALL", "1").strip() == "1"
 RUN_SMALL_T = float(os.environ.get("RUN_SMALL_T", "1.0"))
 RUN_SMALL_STARTUP = float(os.environ.get("RUN_SMALL_STARTUP", "0.5"))
 RUN_SMALL_RATIO = float(os.environ.get("RUN_SMALL_RATIO", "1.0"))
