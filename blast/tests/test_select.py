@@ -364,6 +364,46 @@ class RulesTest(unittest.TestCase):
         self.assertIn("r:closure", trail)
         self.assertEqual(sorted(got), sorted({A, B, C, FLAKY, LAZY}), trail)
 
+    # -- NOCU_METHOD: class without class_users, change confined to methods --------------------
+    def test_nocu_insert_at_top_of_method_selects_its_body_tests(self):
+        raw = dict(FAKE_MAP, class_users={})
+        with flags(RESCUE_IMPORT=False, NOCU_METHOD=True):
+            got, trail = self.run_sel(
+                {"sqlglot/mod.py": ("        return z\n", "        raise RuntimeError('x')\n        return z\n")}, raw=raw)
+        self.assertIn("N:Thing", trail)
+        self.assertIn(B, got)  # line 17 (run's body) -> set 2 -> test b
+
+    def test_nocu_constant_default_selects_body_tests(self):
+        raw = dict(FAKE_MAP, class_users={})
+        with flags(RESCUE_IMPORT=False, NOCU_METHOD=True):
+            got, trail = self.run_sel(
+                {"sqlglot/mod.py": ("    def run(self, z=3):\n", "    def run(self, z=4):\n")}, raw=raw)
+        self.assertIn("N:Thing", trail)
+        self.assertIn(B, got)
+
+    def test_nocu_call_default_is_full(self):
+        raw = dict(FAKE_MAP, class_users={})
+        with flags(RESCUE_IMPORT=False, NOCU_METHOD=True), self.assertRaises(sel.Full):
+            self.run_sel({"sqlglot/mod.py": ("    def run(self, z=3):\n", "    def run(self, z=helper(1)):\n")},
+                         raw=raw)
+
+    def test_nocu_class_attribute_is_full(self):
+        raw = dict(FAKE_MAP, class_users={})
+        with flags(RESCUE_IMPORT=False, NOCU_METHOD=True), self.assertRaises(sel.Full):
+            self.run_sel({"sqlglot/mod.py": ('    KIND = "a"\n', '    KIND = 1 / 0\n')}, raw=raw)
+
+    def test_nocu_body_run_at_import_is_full(self):
+        raw = dict(FAKE_MAP, class_users={},
+                   import_lines={**FAKE_MAP["import_lines"], "sqlglot/mod.py": [1, 4, 9, 13, 14, 16, 17]})
+        with flags(RESCUE_IMPORT=False, NOCU_METHOD=True), self.assertRaises(sel.Full):
+            self.run_sel(
+                {"sqlglot/mod.py": ("        return z\n", "        raise RuntimeError('x')\n        return z\n")}, raw=raw)
+
+    def test_nocu_off_is_full(self):
+        raw = dict(FAKE_MAP, class_users={})
+        with flags(RESCUE_IMPORT=False, NOCU_METHOD=False), self.assertRaises(sel.Full):
+            self.run_sel({"sqlglot/mod.py": ("    def run(self, z=3):\n", "    def run(self, z=4):\n")}, raw=raw)
+
     # -- g) `import sqlglot` in a subprocess ----------------------------------------------------
     def test_g_probe_records_what_import_sqlglot_loads(self):
         self.assertEqual(self.import_mods, ["sqlglot/__init__.py", "sqlglot/eager.py"])

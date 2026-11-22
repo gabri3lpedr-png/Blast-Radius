@@ -121,6 +121,21 @@ MAIN_UNUSED = os.environ.get("MAIN_UNUSED", "1") == "1"
 # Only when the class or a subclass is USED by import-time code (index/import_used.json,
 # blast/build_index.py); a read by a class-creation hook alone keeps the class_users fallback.
 ATTR_IMPORT_FULL = os.environ.get("ATTR_IMPORT_FULL", "1") == "1"
+# NOCU_METHOD=1 (probe-F: the last practice FULL is "no class_users", a=7): a class-body line of a
+# class the map has no class_users for (class_users only tracks Expr / Dialect / Tokenizer / Parser
+# / Generator / ... instances) is narrowed when old and new class differ ONLY inside methods:
+#   skeleton = the class with every method body emptied. Same skeleton -> only method bodies changed
+#   (e.g. a line inserted right after a def header, whose neighbour is the header): the tests the map
+#   credits with each changed method's ORIGINAL body. Every call runs the body, so its callers are
+#   credited; a body line run at import (metaclass __new__, __init_subclass__, ...) -> FULL.
+#   Skeletons that differ only in a method's defaults / decorators (header change): only when the
+#   new header cannot fail at import (new defaults are constants; decorators only removed, or the
+#   builtins property / staticmethod / classmethod added) and the class has no decorators and no
+#   class keywords (metaclass=...). Body-only changes allow an (unchanged) class decorator such as
+#   @mypyc_attr(native_class=True): it runs at import whatever the bodies say. Tests: the method's body tests + every test of a tests/ file
+#   that names the method + rule g (import-time change).
+# Anything else (class attributes, new / renamed methods, nested classes) -> as before.
+NOCU_METHOD = os.environ.get("NOCU_METHOD", "1") == "1"
 # COMPOUND_NAMES=1: a module-level `try:` or `if` (not TYPE_CHECKING) that binds no plain names itself
 # follows the names bound by every simple statement nested in it (rule b name chain). Anything else
 # nested (a call statement, a loop, ...) or a call in the `if` test -> FULL as before.
@@ -150,6 +165,52 @@ IMPORT_SQLGLOT = frozenset({
     "sqlglot/errors.py", "sqlglot/parsers/__init__.py", "sqlglot/parsers/base.py",
     "sqlglot/typing/__init__.py",
 })
+
+
+def _arg_names(a: ast.arguments) -> str:
+    """Argument names and kinds, without defaults / annotations."""
+    return repr(([x.arg for x in a.posonlyargs], [x.arg for x in a.args], a.vararg and a.vararg.arg,
+                 [x.arg for x in a.kwonlyargs], a.kwarg and a.kwarg.arg,
+                 len(a.defaults), [d is None for d in a.kw_defaults]))
+
+
+_SAFE_DECOS = frozenset({"property", "staticmethod", "classmethod"})
+
+
+def _safe_header(o: ast.FunctionDef, n: ast.FunctionDef) -> bool:
+    """The new def header cannot raise at import: annotations unchanged, every changed default
+    a constant, decorators only removed or a bare builtin property/staticmethod/classmethod added."""
+    def ann(a):
+        return [ast.dump(x.annotation) if x.annotation else "" for x in
+                a.posonlyargs + a.args + a.kwonlyargs + [a.vararg, a.kwarg] if x is not None]
+    if ann(o.args) != ann(n.args) or ast.dump(o.returns or ast.Pass()) != ast.dump(n.returns or ast.Pass()):
+        return False
+    for od, nd in zip(o.args.defaults + o.args.kw_defaults, n.args.defaults + n.args.kw_defaults):
+        if (od is None) != (nd is None):
+            return False
+        if nd is not None and ast.dump(od) != ast.dump(nd) and not _const(nd):
+            return False
+    old_d = [ast.dump(d) for d in o.decorator_list]
+    new_d = [ast.dump(d) for d in n.decorator_list]
+    for d in o.decorator_list:  # a removed decorator: only a builtin wrapper, never a registry
+        if ast.dump(d) not in new_d and not (isinstance(d, ast.Name) and d.id in _SAFE_DECOS):
+            return False
+    for d in n.decorator_list:
+        if ast.dump(d) in old_d:
+            continue
+        if not (isinstance(d, ast.Name) and d.id in _SAFE_DECOS):
+            return False
+    return True
+
+
+def _const(n: ast.AST) -> bool:
+    if isinstance(n, ast.Constant):
+        return True
+    if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.USub, ast.UAdd)):
+        return isinstance(n.operand, ast.Constant)
+    if isinstance(n, ast.Tuple):
+        return all(_const(e) for e in n.elts)
+    return False
 
 
 def _compound_names(top) -> list[str] | None:
@@ -494,6 +555,7 @@ class _File:
         self._scopes_same: bool | None = None
         self._attr_cache: dict[tuple[str, ...], frozenset[int] | None] = {}
         self.s_extra: set[int] = set()  # rule s (setUpClass) additions: INFECTION keeps them
+        self.nocu_proven = False  # NOCU_METHOD resolved every class of the last class-body line
         self._new: Locator | None = None  # RESCUE_*: locator of the new text
         self.attr_import_hit: tuple[str, list[str]] | None = None  # rule b': (why, owners)
 
@@ -617,19 +679,28 @@ class _File:
                     if hit:
                         raise Full(f"ATTR_IMPORT_FULL: {'.'.join(loc.classes)}.{why}, "
                                    f"{hit[0].split(':', 1)[1]} used at import")
-            for key in loc.class_keys(module_of(path)):
+            keys = list(loc.class_keys(module_of(path)))
+            nocu_done = 0
+            for key in keys:
                 t = ctx.db.class_user_tests(key)
                 if t is None and NOCU_NAMES and loc.top is not None and names_bound(loc.top):
                     self.note(f"b:no class_users {key.split(':')[1]}")
                     for name in names_bound(loc.top):
                         self.name_effect(name, depth, path)
                     continue
+                if t is None and NOCU_METHOD and path == self.path:
+                    nm = self.nocu_method(loc.classes)
+                    if nm is not None:
+                        self.add(nm, f"N:{'.'.join(loc.classes)}")
+                        nocu_done += 1
+                        continue
                 if t is None:
                     if RESCUE_IMPORT:
                         self.rescue_closure(path, [loc.top], f"no class_users for {key}")
                         continue
                     raise Full(f"no class_users for {key}")
                 self.add(t, f"b:class {key.split(':')[1]}")
+            self.nocu_proven = bool(keys) and nocu_done == len(keys)
             return
         if loc.top is None:
             return  # blank/comment line at module level: neighbours were looked up in a)
@@ -726,8 +797,11 @@ class _File:
         self.import_time = True  # module level, class body or def header
         if loc.kind == "def_header":
             self.map_lines(path, _def_lines(loc.func), f"b:def {loc.func.name}")
+        self.nocu_proven = False
         self.import_effect(path, loc, 0)
-        return False
+        # NOCU_METHOD proved this class-body line's whole effect (method bodies only): its tests are
+        # already in self.out, so an empty result is a proof, not a lookup that found nothing
+        return NOCU_METHOD and bool(loc.classes) and self.nocu_proven
 
     # -- rule x: a file that no longer parses -----------------------------------------------
     def broken(self) -> set[int]:
@@ -737,6 +811,69 @@ class _File:
         return self.out
 
     # -- RESCUE_IMPORT / RESCUE_NOTHING ---------------------------------------------------------
+    def nocu_method(self, classes: list[str]) -> frozenset[int] | None:
+        """NOCU_METHOD: tests for a class-body change confined to methods; None = not provable."""
+        key = ("nocu", *classes)
+        if key not in self._attr_cache:
+            try:
+                self._attr_cache[key] = self._nocu_method(classes)
+            except (SyntaxError, ValueError, RecursionError):
+                self._attr_cache[key] = None
+            t = self._attr_cache[key]
+            self.note(f"N:{'.'.join(classes)} " + ("no" if t is None else f"+{len(t)}"))
+        return self._attr_cache[key]
+
+    def _nocu_method(self, classes: list[str]) -> frozenset[int] | None:
+        ctx, v = self.ctx, self.verdict
+        if v is None or v.kind != prover.CHANGED or not v.new_text:
+            return None
+        oc = attrs.class_node(ctx.locator(self.path).tree, classes)
+        nc = attrs.class_node(Locator(v.new_text, self.path).tree, classes)
+        if oc is None or nc is None or [ast.dump(d) for d in oc.decorator_list] != \
+                [ast.dump(d) for d in nc.decorator_list] or [ast.dump(k) for k in oc.keywords] != \
+                [ast.dump(k) for k in nc.keywords] or [ast.dump(b) for b in oc.bases] != [ast.dump(b) for b in nc.bases]:
+            return None
+        plain = not oc.decorator_list and not oc.keywords  # header changes need a plain class
+        defs = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+        def skel(c, header: bool):
+            out = []
+            for n in c.body:
+                if isinstance(n, defs):
+                    a = n.args
+                    out.append((type(n).__name__, n.name, ast.dump(a) if header else _arg_names(a),
+                                ast.dump(n.returns) if n.returns else "",
+                                [ast.dump(d) for d in n.decorator_list] if header else []))
+                else:
+                    out.append(ast.dump(n))
+            return out
+
+        if skel(oc, False) != skel(nc, False):
+            return None  # a class attribute, a nested class, a method added / renamed / moved
+        olds = [n for n in oc.body if isinstance(n, defs)]
+        news = [n for n in nc.body if isinstance(n, defs)]
+        imp = set(ctx.db.import_lines(self.path))
+        out: set[int] = set()
+        for o, n in zip(olds, news):
+            body_same = [ast.dump(x) for x in o.body] == [ast.dump(x) for x in n.body]
+            head_same = (ast.dump(o.args) == ast.dump(n.args)
+                         and [ast.dump(d) for d in o.decorator_list] == [ast.dump(d) for d in n.decorator_list])
+            if body_same and head_same:
+                continue
+            body_lines = range(o.body[0].lineno, o.end_lineno + 1)
+            if imp.intersection(body_lines):
+                return None  # the body runs at import
+            if not head_same and not (plain and _safe_header(o, n)):
+                return None
+            base, extra = ctx.line_tests(self.path, body_lines)
+            if base:
+                out |= base | extra
+            if not head_same:
+                for p in ctx.name_refs(o.name):
+                    if p.startswith("tests/"):
+                        out |= ctx.tests_by_file.get(p, frozenset())
+        return frozenset(out)
+
     def rescue_closure(self, path: str, nodes, why: str, unmapped_ok: bool = False) -> None:
         """Every test that can import `path` (rule x's closure), when that is provably a superset;
         else Full(why), the original reason."""
