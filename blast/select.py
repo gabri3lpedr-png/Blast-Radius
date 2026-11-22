@@ -52,7 +52,7 @@ import json
 import os
 from pathlib import Path
 
-from blast import attrs, infection, prover, safe
+from blast import attrs, infection, prover, rescue, safe
 from blast.fixtures import TestIndex
 from blast.imports import ImportGraph
 from blast.locate import Loc, Locator, module_of, names_bound
@@ -117,6 +117,18 @@ MAIN_UNUSED = os.environ.get("MAIN_UNUSED", "1") == "1"
 # follows the names bound by every simple statement nested in it (rule b name chain). Anything else
 # nested (a call statement, a loop, ...) or a call in the `if` test -> FULL as before.
 COMPOUND_NAMES = os.environ.get("COMPOUND_NAMES", "1") == "1"
+# RESCUE_IMPORT=1 (probe-E class 6): an import-time change the name rules cannot follow (a class
+# with no class_users, a module-level statement binding no plain names, a dunder def run at import)
+# selects every test that can import the module (rule x's closure) instead of FULL, when the module
+# is not loaded by `import sqlglot` and the changed code writes only to state the module owns
+# (blast/rescue.py). Otherwise the original FULL.
+RESCUE_IMPORT = os.environ.get("RESCUE_IMPORT", "1") == "1"
+# RESCUE_NOTHING=1 (probe-E class 7, "lookup found nothing"): a sqlglot file whose every change is in
+# def bodies no test runs contributes nothing; a file whose import-time lookups found nothing, or
+# that the map has no lines for, -> the importer closure (as RESCUE_IMPORT); a .py outside sqlglot/
+# and tests/ that no sqlglot/tests file names -> nothing; a tests/ data file no test reads, names,
+# or could list -> nothing. Otherwise the original FULL.
+RESCUE_NOTHING = os.environ.get("RESCUE_NOTHING", "1") == "1"
 
 # Rule g. Tests that run `import sqlglot` in a subprocess (ids, never numbers).
 SUBPROCESS_IMPORT_TESTS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
@@ -423,6 +435,16 @@ def scope_signature(text: str, path: str) -> list:
     return out
 
 
+def _unread_data(ctx: Ctx, path: str) -> bool:
+    """A tests/ data file no test read in the map, whose name no sqlglot/tests file contains, while
+    no test file lists a directory: no test can open it."""
+    if not path.startswith("tests/") or rescue.lists_directories(ctx.src):
+        return False
+    name = path.rsplit("/", 1)[-1]
+    stem = name.split(".", 1)[0]
+    return not rescue.mentions(ctx.src, [name, stem])
+
+
 def _added_new_lines(fp) -> list[int]:
     out = []
     for h in fp.hunks:
@@ -453,6 +475,7 @@ class _File:
         self._scopes_same: bool | None = None
         self._attr_cache: dict[tuple[str, ...], frozenset[int] | None] = {}
         self.s_extra: set[int] = set()  # rule s (setUpClass) additions: INFECTION keeps them
+        self._new: Locator | None = None  # RESCUE_*: locator of the new text
 
     # -- rule b': ATTR_LEVEL ------------------------------------------------------------------
     def attr_level(self, classes: list[str]) -> frozenset[int] | None:
@@ -573,6 +596,9 @@ class _File:
                         self.name_effect(name, depth, path)
                     continue
                 if t is None:
+                    if RESCUE_IMPORT:
+                        self.rescue_closure(path, [loc.top], f"no class_users for {key}")
+                        continue
                     raise Full(f"no class_users for {key}")
                 self.add(t, f"b:class {key.split(':')[1]}")
             return
@@ -584,6 +610,9 @@ class _File:
             if names is not None:
                 self.note(f"b:compound {type(loc.top).__name__} {','.join(names)}")
         if names is None:
+            if RESCUE_IMPORT:
+                self.rescue_closure(path, [loc.top], f"{path}:{loc.line} module-level statement binds no plain names")
+                return
             raise Full(f"{path}:{loc.line} module-level statement binds no plain names")
         if safe.on("B"):
             raise Full(f"SAFE B: {path}:{loc.line} module-level names {','.join(names)}")
@@ -594,6 +623,9 @@ class _File:
         """IMPORT_FUNC: def `func` of `path` runs at import time and its body changed."""
         name = getattr(func, "name", None)
         if not name or (name.startswith("__") and name.endswith("__")):
+            if RESCUE_IMPORT and name:
+                self.rescue_closure(path, [func], f"{path}: def {name} runs at import, called implicitly")
+                return
             raise Full(f"{path}: def {name} runs at import, called implicitly")
         self.note(f"i:def {name}")
         self.name_effect(name, depth, path)
@@ -670,7 +702,46 @@ class _File:
 
     # -- rule x: a file that no longer parses -----------------------------------------------
     def broken(self) -> set[int]:
-        ctx, path = self.ctx, self.path
+        self.closure_tests(self.path)
+        if not self.out and not self.path.startswith("tests/"):
+            raise Full(f"x: nothing imports {self.path}")
+        return self.out
+
+    # -- RESCUE_IMPORT / RESCUE_NOTHING ---------------------------------------------------------
+    def rescue_closure(self, path: str, nodes, why: str, unmapped_ok: bool = False) -> None:
+        """Every test that can import `path` (rule x's closure), when that is provably a superset;
+        else Full(why), the original reason."""
+        trees = [(nodes, self.ctx.locator(path).tree)]
+        if path == self.path:  # the changed file itself: guard its old AND new changed statements
+            trees += self._changed_tops()
+        for ns, tree in trees:
+            if not rescue.writes_only_owned(ns, tree):
+                raise Full(why)
+        before = set(self.out)
+        try:
+            self.closure_tests(path, unmapped_ok)
+        except Full:
+            self.out = before
+            raise Full(why) from None
+        self.note(f"r:closure {path.rsplit('/', 1)[-1]}+{len(self.out - before)}")
+
+    def _changed_tops(self) -> list[tuple[list, ast.Module]]:
+        """Module-level statements holding a changed line: (old ones, old tree), (new ones, new tree)."""
+        v = self.verdict
+        if v is None or v.kind != prover.CHANGED:
+            return []
+        old = self.ctx.locator(self.path)
+        if self._new is None:
+            self._new = Locator(v.new_text, self.path)
+        new = self._new
+        olds = [old.locate(n).top for n in v.lines]
+        news = [new.locate(n).top for n in (_added_new_lines(v.fp) if v.fp is not None else [])]
+        return [(olds, old.tree), (news, new.tree)]
+
+    def closure_tests(self, path: str, unmapped_ok: bool = False) -> None:
+        """Rule x: add every test that can import `path`; Full if `import sqlglot` loads it.
+        unmapped_ok: `path` itself may have no map lines (RESCUE_NOTHING, map has no lines)."""
+        ctx = self.ctx
         if "<unknown>" in ctx.import_sqlglot:
             raise Full("no record of the modules `import sqlglot` loads")
         g = ctx.imports()
@@ -685,6 +756,8 @@ class _File:
                 self.add(ctx.tests_by_file.get(x), f"x:file {x.rsplit('/', 1)[-1]}")
                 continue
             if not ctx.db.has_file(x):
+                if unmapped_ok and x == path:
+                    continue
                 raise Full(f"x: map has no lines for {x}")
             self.map_lines(x, ctx.db.file_lines(x), f"x:lines {x.rsplit('/', 1)[-1]}")
             mod = module_of(x)
@@ -706,9 +779,6 @@ class _File:
             self.map_lines(p, range(a, b + 1), f"x:dynamic {p.rsplit('/', 1)[-1]}:{a}")
         if self.ctx.subprocess_import_tests:
             self.add(ctx.subprocess_import_tests, "x:lazy_load")
-        if not self.out and not path.startswith("tests/"):
-            raise Full(f"x: nothing imports {path}")
-        return self.out
 
     def ref_site(self, p: str, line: int, tag: str | None) -> None:
         """A use of a broken module outside its closure: runtime -> who ran it; else FULL."""
@@ -784,8 +854,14 @@ class _File:
         is_test = path.startswith("tests/")
         if not is_test:
             if not path.startswith("sqlglot/"):
+                if RESCUE_NOTHING and self.unreferenced_outside(path):
+                    self.note("r:outside, never named")
+                    return self.out
                 raise Full(f"{path} is outside sqlglot/ and tests/")
             if not ctx.db.has_file(path):
+                if RESCUE_NOTHING:
+                    self.rescue_closure(path, [], f"map has no lines for {path}", unmapped_ok=True)
+                    return self.out
                 raise Full(f"map has no lines for {path}")
         if not v.lines:
             raise Full(f"{path}: no changed original lines")
@@ -820,8 +896,24 @@ class _File:
             if INERT_EMPTY and all_inert:
                 self.note("n:every changed line inert")
                 return self.out
-            raise Full(f"map lookup found nothing for {path}")
+            why = f"map lookup found nothing for {path}"
+            if RESCUE_NOTHING:
+                if not is_test and not self.import_time:
+                    self.note("r:dead defs only")  # no test runs any changed def: nothing to run
+                    return self.out
+                self.rescue_closure(path, [], why)
+                if self.out:
+                    return self.out
+            raise Full(why)
         return self.out
+
+    def unreferenced_outside(self, path: str) -> bool:
+        """A .py outside sqlglot/ and tests/ (benchmarks/, pdoc/...) that no sqlglot or test file
+        names: neither its top directory nor its file name appears anywhere in their text."""
+        if "/" not in path:
+            return False  # a top-level script (setup.py is structural anyway)
+        top, name = path.split("/", 1)[0], path.rsplit("/", 1)[-1]
+        return not rescue.mentions(self.ctx.src, [top, name])
 
 
 def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]:
@@ -862,6 +954,9 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
                 )
                 rule = "e:fixture-name"
             if not t:
+                if RESCUE_NOTHING and _unread_data(ctx, v.path):
+                    trail.append(f"{v.path}: r:data never read or named")
+                    continue
                 raise Full(f"no test reads {v.path}")
             out |= t
             trail.append(f"{v.path}: {rule}+{len(t)}")

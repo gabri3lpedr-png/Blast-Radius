@@ -155,6 +155,8 @@ class WeirdPatchesEndToEnd(unittest.TestCase):
         tests = json.loads((ROOT / "sample" / "tests.json").read_text("utf-8"))["tests"]
         num = {t["id"]: t["number"] for t in tests}
         executor = {n for i, n in num.items() if i.startswith("tests/test_executor.py::TestExecutor::")}
+        # HEAVY_REPLAY=static drops test_execute_tpcds: it reads only the tpc-ds fixtures
+        executor.discard(num["tests/test_executor.py::TestExecutor::test_execute_tpcds"])
         self.assertIn(num["tests/test_executor.py::TestExecutor::test_execute_tpch"], selected["fixture_tpch"])
         self.assertIn(num["tests/test_optimizer.py::TestOptimizer::test_tpch"], selected["fixture_tpch"])
         self.assertLessEqual(executor, selected["fixture_tpch"])

@@ -8,7 +8,7 @@
   "empty": "FULL",
   "five_files": "MAP",
   "fixture_tpch": "MAP",
-  "fixture_unread": "FULL",
+  "fixture_unread": "MAP",
   "garbage": "FULL",
   "mode_change": "NOOP",
   "new_py": "FULL",

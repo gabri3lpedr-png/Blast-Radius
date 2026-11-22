@@ -133,6 +133,19 @@ IDS = [
 ]
 A, B, FIX, OTHER, C, FLAKY, LAZY = range(7)
 
+
+@contextmanager
+def flags(**kw):
+    """Pin blast.select flags for one block."""
+    old = {k: getattr(sel, k) for k in kw}
+    for k, v in kw.items():
+        setattr(sel, k, v)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            setattr(sel, k, v)
+
 # The fake map. Map test index != tests.json number on purpose (order differs).
 MAP_TESTS = [IDS[FLAKY], IDS[A], IDS[B], IDS[FIX], IDS[OTHER], "tests/gone.py::T::test_gone"]
 a, b, fix, other, flaky = 1, 2, 3, 4, 0  # map indexes
@@ -270,14 +283,17 @@ class RulesTest(unittest.TestCase):
             prover.SYNTAX_LAZY = old
 
     def test_c_dead_line_alone_is_full(self):
-        old = sel.INERT_EMPTY
-        sel.INERT_EMPTY = False
-        try:
+        with flags(INERT_EMPTY=False, RESCUE_NOTHING=False):
             for fl in (False, True):
                 with self.assertRaises(sel.Full):
                     self.run_sel({"sqlglot/mod.py": ("    return 0\n", "    return 1\n")}, func_level=fl)
-        finally:
-            sel.INERT_EMPTY = old
+
+    def test_rescue_dead_line_alone_is_empty(self):
+        with flags(INERT_EMPTY=False, RESCUE_NOTHING=True):
+            for fl in (False, True):
+                got, trail = self.run_sel({"sqlglot/mod.py": ("    return 0\n", "    return 1\n")}, func_level=fl)
+                self.assertEqual(got, set(), trail)
+                self.assertIn("r:dead defs only", trail)
 
     def test_c_dead_line_alone_is_empty_with_inert_empty(self):
         old = sel.INERT_EMPTY
@@ -313,8 +329,19 @@ class RulesTest(unittest.TestCase):
         self.assertIn("b:name LIMIT", trail)
 
     def test_b_new_module_statement_without_names_is_full(self):
-        with self.assertRaises(sel.Full):
+        with flags(RESCUE_IMPORT=False), self.assertRaises(sel.Full):
             self.run_sel({"sqlglot/mod.py": ("LIMIT = 10\n", "LIMIT = 10\nprint('import-time')\n")})
+
+    def test_rescue_module_statement_without_names_is_importer_closure(self):
+        with flags(RESCUE_IMPORT=True):
+            got, trail = self.run_sel({"sqlglot/mod.py": ("LIMIT = 10\n", "LIMIT = 10\nprint('import-time')\n")})
+        self.assertIn("r:closure", trail)
+        self.assertEqual(sorted(got), sorted({A, B, OTHER, C, FLAKY, LAZY}), trail)
+
+    def test_rescue_foreign_write_stays_full(self):
+        # writes into another module's object: a test that never imports mod.py could observe it
+        with flags(RESCUE_IMPORT=True), self.assertRaises(sel.Full):
+            self.run_sel({"sqlglot/mod.py": ("LIMIT = 10\n", "LIMIT = 10\nos.environ.update(X='1')\n")})
 
     def test_b_import_only_file_is_mapped(self):
         # a module whose code only runs at import has import_lines but no "lines" (tsql.py)
@@ -326,8 +353,15 @@ class RulesTest(unittest.TestCase):
 
     def test_b_class_without_class_users_is_full(self):
         raw = dict(FAKE_MAP, class_users={})
-        with self.assertRaises(sel.Full):
+        with flags(RESCUE_IMPORT=False), self.assertRaises(sel.Full):
             self.run_sel({"sqlglot/mod.py": ('    KIND = "a"\n', '    KIND = "b"\n')}, raw=raw)
+
+    def test_rescue_class_without_class_users_is_importer_closure(self):
+        raw = dict(FAKE_MAP, class_users={})
+        with flags(RESCUE_IMPORT=True):
+            got, trail = self.run_sel({"sqlglot/mod.py": ('    KIND = "a"\n', '    KIND = "b"\n')}, raw=raw)
+        self.assertIn("r:closure", trail)
+        self.assertEqual(sorted(got), sorted({A, B, C, FLAKY, LAZY}), trail)
 
     # -- g) `import sqlglot` in a subprocess ----------------------------------------------------
     def test_g_probe_records_what_import_sqlglot_loads(self):
@@ -459,8 +493,14 @@ class RulesTest(unittest.TestCase):
         self.assertIn("e:fixture-name", trail)
 
     def test_e_unknown_data_is_full(self):
-        with self.assertRaises(sel.Full):
+        with flags(RESCUE_NOTHING=False), self.assertRaises(sel.Full):
             self.run_sel({"tests/fixtures/optimizer/baz.sql": ("SELECT 1;\n", "SELECT 2;\n")})
+
+    def test_rescue_unread_unnamed_data_is_empty(self):
+        with flags(RESCUE_NOTHING=True):
+            got, trail = self.run_sel({"tests/fixtures/optimizer/baz.sql": ("SELECT 1;\n", "SELECT 2;\n")})
+        self.assertEqual(got, set(), trail)
+        self.assertIn("r:data never read or named", trail)
 
     # -- the stub: every CHANGED file -> FULL -------------------------------------------
     def test_stub_map_is_full_for_code(self):
