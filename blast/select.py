@@ -129,6 +129,11 @@ RESCUE_IMPORT = os.environ.get("RESCUE_IMPORT", "1") == "1"
 # and tests/ that no sqlglot/tests file names -> nothing; a tests/ data file no test reads, names,
 # or could list -> nothing. Otherwise the original FULL.
 RESCUE_NOTHING = os.environ.get("RESCUE_NOTHING", "1") == "1"
+# NO_CHAIN=1 (variant var-nochain): drop every test whose ONLY reason is rule b's module-name chain
+# (added while following a name from a module-level / class-body change, not under an import-time
+# def or rule x), unless some other rule (line map, def, class_users at the changed file, rule
+# s/g/f, fixtures, ...) also added it. The ablation measured by tools/rule_report.py.
+NO_CHAIN = os.environ.get("NO_CHAIN", "1") == "1"
 
 # Rule g. Tests that run `import sqlglot` in a subprocess (ids, never numbers).
 SUBPROCESS_IMPORT_TESTS = ("tests/dialects/test_dialect.py::TestDialect::test_lazy_load",)
@@ -476,6 +481,16 @@ class _File:
         self._attr_cache: dict[tuple[str, ...], frozenset[int] | None] = {}
         self.s_extra: set[int] = set()  # rule s (setUpClass) additions: INFECTION keeps them
         self._new: Locator | None = None  # RESCUE_*: locator of the new text
+        self._labels: list[str] = []  # NO_CHAIN: rule context stack ("chain", "ifunc", "x")
+        self.chain_hits: set[int] = set()  # NO_CHAIN: tests added under the name chain
+        self.other_hits: set[int] = set()  # NO_CHAIN: tests added by any other rule
+
+    def _record(self, tests, chain: bool) -> None:
+        if tests:
+            (self.chain_hits if chain else self.other_hits).update(tests)
+
+    def _in_chain(self) -> bool:
+        return bool(self._labels) and self._labels[-1] == "chain"
 
     # -- rule b': ATTR_LEVEL ------------------------------------------------------------------
     def attr_level(self, classes: list[str]) -> frozenset[int] | None:
@@ -554,6 +569,7 @@ class _File:
     def add(self, tests, tag: str) -> bool:
         if tests:
             self.out |= tests
+            self._record(tests, self._in_chain())
             self.note(f"{tag}+{len(tests)}")
             return True
         return False
@@ -564,7 +580,9 @@ class _File:
         if base is None:
             return False
         self.s_extra |= extra
+        self._record(extra, False)
         if tag is None:
+            self._record(base, self._in_chain())
             self.out |= base | extra
         else:
             self.add(base, tag)
@@ -628,9 +646,20 @@ class _File:
                 return
             raise Full(f"{path}: def {name} runs at import, called implicitly")
         self.note(f"i:def {name}")
-        self.name_effect(name, depth, path)
+        self._labels.append("ifunc")
+        try:
+            self.name_effect(name, depth, path)
+        finally:
+            self._labels.pop()
 
     def name_effect(self, name: str, depth: int, origin: str | None = None) -> None:
+        self._labels.append(self._labels[-1] if self._labels else "chain")
+        try:
+            self._name_effect(name, depth, origin)
+        finally:
+            self._labels.pop()
+
+    def _name_effect(self, name: str, depth: int, origin: str | None = None) -> None:
         key = (origin, name) if MODULE_NAMES and origin else name
         if key in self._seen_names:
             return
@@ -702,7 +731,11 @@ class _File:
 
     # -- rule x: a file that no longer parses -----------------------------------------------
     def broken(self) -> set[int]:
-        self.closure_tests(self.path)
+        self._labels.append("x")
+        try:
+            self.closure_tests(self.path)
+        finally:
+            self._labels.pop()
         if not self.out and not self.path.startswith("tests/"):
             raise Full(f"x: nothing imports {self.path}")
         return self.out
@@ -921,12 +954,16 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
     out: set[int] = set()
     trail: list[str] = []
     wide = False
+    chain: set[int] = set()  # NO_CHAIN
+    other: set[int] = set()
     for v in verdicts:
         if v.kind == prover.CHANGED:
             f = _File(ctx, v.path)
             f.run(v)
             if INFECTION and v.path.startswith("sqlglot/") and v.path.endswith(".py"):
                 f.infect(v)
+            chain |= f.chain_hits
+            other |= f.other_hits
             out |= f.out
             wide |= f.wide
             if f.import_time and v.path.startswith("sqlglot/"):
@@ -934,11 +971,13 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
                     raise Full("no record of the modules `import sqlglot` loads")
                 if ctx.loaded_by_import_sqlglot(v.path) and ctx.subprocess_import_tests - out:
                     out |= ctx.subprocess_import_tests
+                    other |= ctx.subprocess_import_tests
                     f.note(f"g:import sqlglot+{len(ctx.subprocess_import_tests)}")
             trail.append(f"{v.path}: {' '.join(f.notes)}")
         elif v.kind == prover.BROKEN:
             f = _File(ctx, v.path)
             out |= f.broken()
+            other |= f.out
             trail.append(f"{v.path}: {' '.join(f.notes)}")
         elif v.kind == prover.DATA:
             if safe.on("D"):
@@ -959,6 +998,7 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
                     continue
                 raise Full(f"no test reads {v.path}")
             out |= t
+            other |= t
             trail.append(f"{v.path}: {rule}+{len(t)}")
         elif v.kind != prover.NOOP:
             raise Full(f"{v}")
@@ -976,4 +1016,9 @@ def select(ctx: Ctx, verdicts: list[prover.FileVerdict]) -> tuple[set[int], str]
         if extra:
             out |= extra
             trail.append(f"f:+{len(extra)}")
+    if NO_CHAIN:  # after rule f, as the ablation: f's extras are computed from the full selection
+        drop = (chain - other - ctx.subprocess_import_tests) & out
+        if drop:
+            out -= drop
+            trail.append(f"nochain:-{len(drop)}")
     return out, "; ".join(trail)
